@@ -4,13 +4,112 @@
 
 ## 范围
 
-本仓库从零开始实现上述方向的可用工具，不依赖外部同类实现。
+本仓库从零开始实现上述方向的可用工具，不依赖外部同类实现，仅使用 Python
+标准库（要求 Python 3.10+）。
 
-## 状态
+当前版本兼容范围限定为**同一币种的单笔结算请求**：多币种换算与外部定价不
+在范围内；单笔请求内出现混合币种直接抛出 `MixedCurrencyError`。无任何落盘
+行为，审计台账以内存中的追加式序列表示。
 
-初始基线：只有本说明，尚无实现。
+## 公开入口
+
+```python
+from decimal import Decimal
+from vault_guard import ClearingEngine
+
+engine = ClearingEngine()
+result = engine.process(
+    transaction_id="TX-001",          # 唯一业务流水号
+    currency="USD",                   # 账户币种
+    pool_balance=Decimal("100"),      # 资金池可用余额
+    settlement_amount=Decimal("50"),  # 本次拟清算金额
+    notional_exposure=Decimal("100"), # 账户名义敞口
+    base_limit=Decimal("100"),        # 账户基础限额
+    risk_factor=Decimal("0.5"),       # 风险系数，取值 [0, 1]
+    creditors=[                       # 优先债权清单，按先后顺序受偿
+        ("senior", Decimal("60")),
+        ("mezzanine", Decimal("30")),
+        ("equity", Decimal("10")),
+    ],
+    supplementary_capital=Decimal("25"),  # 补充资本，默认 0
+)
+```
+
+`creditors` 每项支持三种等价形式：`(name, amount)`、
+`(name, amount, currency)`、`{"name": ..., "amount": ..., "currency": ...}`
+或 `vault_guard.Creditor` 对象。金额接受 `int` / `float` / `Decimal`，
+内部统一精确归一化为 `Decimal`（`float` 按其字符串形式转换，如 `0.6` →
+`Decimal("0.6")`）；NaN、无穷及非数值类型抛出 `ValueError`。
+
+需要一次性处理时可使用模块级便捷函数
+`vault_guard.process_settlement(...)`（参数与返回结构相同，但不保留跨请求
+台账与去重状态）。
+
+## 处理规则（确定顺序）
+
+1. **输入校验**：负数金额/余额、重复流水号、缺币种、空债权清单、系数越界
+   分别抛出对应异常（见下），不静默修正输入。
+2. **限额校验**：风险占用 = 拟清算金额 + 名义敞口 × 风险系数。
+   - 拟清算金额 > 可用余额，或风险占用 > 基础限额 → 拒绝；
+   - 拒绝时 `approved=False`、可用余额不变、各层分配全为 0、不确认坏账，
+     并生成一条拒绝审计（`rejection_reason` 区分两种原因）。
+   - 边界取等号放行；基础限额为 0 时仅允许风险占用为 0 的请求通过。
+3. **清算瀑布**：请求通过后，资金池（本次拟清算金额）按优先债权清单先后
+   顺序分配，高优先级债权先受偿；每层实际分配不超过其债权金额与剩余资金。
+4. **补充资本**：在资金池之后，仍按清单顺序补足各债权的剩余未偿部分，
+   直至资本用尽。
+5. **坏账归因**：最终未覆盖坏账 = 两层分配后仍未受偿的债权总额；逐项归因
+   给出每笔债权的池内分配、资本承担与坏账金额，逐项坏账合计恒等于未覆盖
+   坏账，且对每笔债权满足 `池内 + 资本 + 坏账 = 债权金额`。
+
+## 返回结构
+
+成功与拒绝路径使用同构的 `SettlementResult`：
+
+| 字段 | 含义 |
+| --- | --- |
+| `transaction_id` | 业务流水号 |
+| `approved` | 放行状态 |
+| `validated_available_balance` | 校验后可用余额（拒绝时等于输入余额） |
+| `creditors` | 按清单顺序的债权名称元组 |
+| `pool_allocations` | 各债权的池内实际分配 |
+| `capital_allocations` | 各债权的补充资本承担 |
+| `attributions` | 逐项 `CreditorAttribution`（含 `bad_debt`） |
+| `uncovered_bad_debt` | 未覆盖坏账总额（拒绝路径为 0） |
+| `risk_occupancy` | 风险占用 |
+| `event_id` | 本请求唯一审计事件标识 |
+| `rejection_reason` | 拒绝原因码，放行时为 `None` |
+
+## 异常类型
+
+| 情况 | 异常 |
+| --- | --- |
+| 负数金额/余额、非数值、空流水号 | `ValueError`（内建） |
+| 重复流水号 | `vault_guard.DuplicateTransactionError` |
+| 缺币种 | `vault_guard.InvalidCurrencyError` |
+| 空债权清单 | `vault_guard.EmptyCreditorListError` |
+| 风险系数越界（< 0 或 > 1） | `vault_guard.InvalidRiskFactorError` |
+| 单笔请求内混合币种 | `vault_guard.MixedCurrencyError` |
+
+校验异常不产生任何半成品分配，也不写入审计台账；失败请求的流水号不被占用，
+可在修正后用同一流水号重新提交。
+
+## 审计台账
+
+- 每个被引擎接受处理的请求（放行或拒绝）**恰好**生成一个事件标识，台账为
+  实例内内存中的追加式序列，序号单调递增。
+- 事件包含流水号、输入摘要、校验结果、风险占用、各层分配与最终未覆盖金额。
+- 只读查询不触发清算：`engine.audit_log`（快照）、`engine.events()`、
+  `engine.get_event(transaction_id)`、`engine.result_of(transaction_id)`、
+  `engine.has_transaction(transaction_id)`。
+
+## 测试
+
+```bash
+python3 -m unittest discover -s tests -v
+```
 
 ## 约定
 
 - 公开行为以 README 与源码为准。
-- 后续需求在此基线上增量实现。
+- 后续需求在此基线上增量实现，既有入口语义保持不变。
