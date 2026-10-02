@@ -7,9 +7,14 @@
 本仓库从零开始实现上述方向的可用工具，不依赖外部同类实现，仅使用 Python
 标准库（要求 Python 3.10+）。
 
-当前版本兼容范围限定为**同一币种的单笔结算请求**：多币种换算与外部定价不
-在范围内；单笔请求内出现混合币种直接抛出 `MixedCurrencyError`。无任何落盘
+当前版本兼容范围限定为**同一币种的结算请求**：多币种换算与外部定价不
+在范围内；请求内出现混合币种直接抛出 `MixedCurrencyError`。无任何落盘
 行为，审计台账以内存中的追加式序列表示。
+
+除单笔入口外，另提供**多笔批量结算**入口 `engine.process_batch(...)`
+（及模块级 `process_settlement_batch(...)`）：批次携带统一币种与期初
+池余额，批内请求按序以滚动余额执行；单笔清算、`SettlementResult` 与
+审计语义保持不变。
 
 ## 公开入口
 
@@ -44,6 +49,60 @@ result = engine.process(
 需要一次性处理时可使用模块级便捷函数
 `vault_guard.process_settlement(...)`（参数与返回结构相同，但不保留跨请求
 台账与去重状态）。
+
+## 多笔批量结算
+
+```python
+batch = engine.process_batch(
+    currency="USD",                       # 批次统一币种
+    opening_pool_balance=Decimal("100"),  # 批次期初资金池余额
+    requests=[                            # 逐笔请求，字段沿用单笔 process
+        {
+            "transaction_id": "TX-101",
+            "settlement_amount": Decimal("50"),
+            "notional_exposure": Decimal("0"),
+            "base_limit": Decimal("100"),
+            "risk_factor": Decimal("0"),
+            "creditors": [("senior", Decimal("50"))],
+            "supplementary_capital": Decimal("0"),  # 可选，默认 0
+        },
+        {
+            "transaction_id": "TX-102",
+            "settlement_amount": Decimal("40"),
+            "notional_exposure": Decimal("0"),
+            "base_limit": Decimal("100"),
+            "risk_factor": Decimal("0"),
+            "creditors": [("senior", Decimal("40"))],
+        },
+    ],
+)
+batch.results                       # 与 requests 同序的各笔 SettlementResult
+batch.event_ids                     # 各笔请求的审计事件 ID（同序）
+batch.validated_available_balance   # 批次最终滚动余额
+```
+
+批量规则：
+
+1. **整批先校验，再执行**：批次在任何状态变更之前先完成全部请求的校验。
+   `requests` 为空、批次币种缺失、债权币种与批次不一致、流水号批内重复或
+   与引擎台账重复，依次抛出 `EmptyBatchError`、`InvalidCurrencyError`、
+   `MixedCurrencyError`、`DuplicateTransactionError`；空债权清单、
+   `risk_factor` 越界分别抛出 `EmptyCreditorListError`、
+   `InvalidRiskFactorError`；金额 / 余额非法仍抛内建 `ValueError`。
+   任一请求不合法则整批拒绝：**不生成事件、不占用流水号、不改余额**，
+   批内已暂存状态一并回退。
+2. **滚动余额执行**：校验通过后按 `requests` 顺序逐笔执行限额校验，每笔
+   看到的可用余额是期初余额经前序放行请求池内分配扣减后的即时余额。
+   拟清算金额超余额或风险占用超 `base_limit` 的请求被拒绝
+   （`rejection_reason` 分别为 `SETTLEMENT_EXCEEDS_AVAILABLE_BALANCE`、
+   `RISK_OCCUPANCY_EXCEEDS_BASE_LIMIT`），拒绝请求不动资金、不确认坏账，
+   也不阻断后续请求。
+3. **结果与事件**：`BatchSettlementResult` 不可变；`results` 与 `requests`
+   同序，单笔结果内的 `validated_available_balance` 为该笔处理完后的即时
+   余额，批次级 `validated_available_balance` 为最终余额；`event_ids` 是
+   各笔请求的事件 ID，序号在台账内单调递增；**批次本身不另建事件**。
+4. 模块级 `process_settlement_batch(...)` 使用一次性引擎实例返回结果，
+   **不跨批次去重**；需要跨批共享台账与去重时复用同一 `ClearingEngine`。
 
 ## 处理规则（确定顺序）
 
@@ -85,11 +144,12 @@ result = engine.process(
 | 情况 | 异常 |
 | --- | --- |
 | 负数金额/余额、非数值、空流水号 | `ValueError`（内建） |
-| 重复流水号 | `vault_guard.DuplicateTransactionError` |
-| 缺币种 | `vault_guard.InvalidCurrencyError` |
+| 批次请求为空 | `vault_guard.EmptyBatchError` |
+| 重复流水号（单笔/批内/台账） | `vault_guard.DuplicateTransactionError` |
+| 缺币种（单笔或批次） | `vault_guard.InvalidCurrencyError` |
 | 空债权清单 | `vault_guard.EmptyCreditorListError` |
 | 风险系数越界（< 0 或 > 1） | `vault_guard.InvalidRiskFactorError` |
-| 单笔请求内混合币种 | `vault_guard.MixedCurrencyError` |
+| 请求内混合币种（含与批次币种不一致） | `vault_guard.MixedCurrencyError` |
 
 校验异常不产生任何半成品分配，也不写入审计台账；失败请求的流水号不被占用，
 可在修正后用同一流水号重新提交。
@@ -97,7 +157,8 @@ result = engine.process(
 ## 审计台账
 
 - 每个被引擎接受处理的请求（放行或拒绝）**恰好**生成一个事件标识，台账为
-  实例内内存中的追加式序列，序号单调递增。
+  实例内内存中的追加式序列，序号单调递增。批量批次逐请求追加事件，
+  **批次本身不另建事件**；整批校验失败时不产生任何事件。
 - 事件包含流水号、输入摘要、校验结果、风险占用、各层分配与最终未覆盖金额。
 - 只读查询不触发清算：`engine.audit_log`（快照）、`engine.events()`、
   `engine.get_event(transaction_id)`、`engine.result_of(transaction_id)`、

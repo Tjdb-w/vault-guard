@@ -13,6 +13,7 @@ __all__ = [
     "SettlementRequest",
     "CreditorAttribution",
     "SettlementResult",
+    "BatchSettlementResult",
     "AuditEvent",
 ]
 
@@ -101,6 +102,31 @@ class SettlementResult:
     @property
     def total_capital_allocated(self) -> Decimal:
         return sum(self.capital_allocations, Decimal(0))
+
+
+@dataclass(frozen=True)
+class BatchSettlementResult:
+    """多笔批量结算的公开返回结构（不可变）。
+
+    - ``results``：与批次内 ``requests`` 严格同序的各笔
+      :class:`SettlementResult`；每笔结果中的
+      ``validated_available_balance`` 是该笔处理完后的即时余额。
+    - ``event_ids``：批次内各请求追加的审计事件 ID，与 ``results`` 同序；
+      批次本身不另建事件。
+    - ``validated_available_balance``：批次全部处理完后的最终滚动余额。
+    """
+
+    results: tuple[SettlementResult, ...]
+    event_ids: tuple[str, ...]
+    validated_available_balance: Decimal
+
+    @property
+    def approved_results(self) -> tuple[SettlementResult, ...]:
+        return tuple(r for r in self.results if r.approved)
+
+    @property
+    def rejected_results(self) -> tuple[SettlementResult, ...]:
+        return tuple(r for r in self.results if not r.approved)
 
 
 @dataclass(frozen=True)

@@ -1,7 +1,9 @@
 """清算风控引擎：限额校验、清算瀑布、坏账归因与内存审计台账。
 
-公开入口为 :meth:`ClearingEngine.process`（模块级便捷函数
-:func:`process_settlement` 内部也持有自己的引擎实例）。
+公开入口为 :meth:`ClearingEngine.process`（单笔）与
+:meth:`ClearingEngine.process_batch`（多笔批次；模块级便捷函数
+:func:`process_settlement` / :func:`process_settlement_batch` 内部各自
+持有自己的一次性引擎实例）。
 
 处理严格按确定顺序执行：
 
@@ -12,6 +14,8 @@
 5. 归因并追加恰好一条审计事件。
 
 校验异常不产生任何分配，也不写入台账；重复流水号在任何状态变更之前抛出。
+批次入口在任何状态变更之前先完成整批校验：任一请求不合法即整批拒绝，
+已通过校验的流水号也不被占用；批次本身不生成审计事件。
 """
 
 from collections.abc import Iterable, Mapping, Sequence
@@ -21,6 +25,7 @@ from typing import Union
 
 from .errors import (
     DuplicateTransactionError,
+    EmptyBatchError,
     EmptyCreditorListError,
     InvalidCurrencyError,
     InvalidRiskFactorError,
@@ -28,13 +33,18 @@ from .errors import (
 )
 from .models import (
     AuditEvent,
+    BatchSettlementResult,
     Creditor,
     CreditorAttribution,
     SettlementRequest,
     SettlementResult,
 )
 
-__all__ = ["ClearingEngine", "process_settlement"]
+__all__ = [
+    "ClearingEngine",
+    "process_settlement",
+    "process_settlement_batch",
+]
 
 Number = Union[int, float, Decimal]
 
@@ -165,6 +175,166 @@ class ClearingEngine:
         return result
 
     # ------------------------------------------------------------------ #
+    # 批量入口（整批先校验、滚动余额执行；批次本身不建事件）
+    # ------------------------------------------------------------------ #
+
+    def process_batch(
+        self,
+        currency: str,
+        opening_pool_balance: Number,
+        requests: Sequence[Mapping[str, object]],
+    ) -> BatchSettlementResult:
+        """按序处理一批同币种结算请求，返回不可变批量结果。
+
+        批次字段：
+
+        - ``currency``：批次币种，批内所有请求共用；逐笔请求无需携带
+          币种，若显式携带则必须与批次一致，否则按
+          :class:`MixedCurrencyError` 处理；债权币种同样必须与批次一致。
+        - ``opening_pool_balance``：批次期初资金池余额；各笔看到的可用
+          余额为自此滚动的即时余额（被放行请求的池内分配逐笔扣减）。
+        - ``requests``：单笔请求映射序列，字段沿用 :meth:`process`
+          （``transaction_id`` / ``settlement_amount`` /
+          ``notional_exposure`` / ``base_limit`` / ``risk_factor`` /
+          ``creditors`` / 可选 ``supplementary_capital``；不含
+          ``currency`` 与 ``pool_balance``）。
+
+        任何一笔请求校验不通过，整批在任何状态变更之前被拒绝：不生成
+        事件、不占用流水号、余额与台账均保持批次开始前状态。通过校验的
+        请求随后按序以滚动余额执行限额与清算；被限额拒绝的请求不动资金、
+        不确认坏账，但仍产生一条拒绝事件，其后的请求继续处理。
+        """
+        # 第一层：批次级校验先于一切。
+        if requests is None:
+            raise EmptyBatchError("批量结算请求为空")
+        try:
+            iterator = iter(requests)
+        except TypeError:
+            raise EmptyBatchError("批量结算请求为空") from None
+        raw_requests = list(iterator)
+        if not raw_requests:
+            raise EmptyBatchError("批量结算请求为空")
+
+        if not isinstance(currency, str) or not currency.strip():
+            raise InvalidCurrencyError("账户币种缺失或为空")
+        currency = currency.strip()
+
+        opening = _as_decimal(opening_pool_balance, "opening_pool_balance")
+        _check_non_negative(opening, "opening_pool_balance")
+
+        # 第二层：逐笔字段校验，整批完成前不触碰引擎状态。
+        # 批内暂存集合从台账已有流水号复制：批内重复与台账重复同源判定。
+        validated: list[SettlementRequest] = []
+        pending_seen: set[str] = set(self._seen_transactions)
+        for index, raw in enumerate(raw_requests):
+            if not isinstance(raw, Mapping):
+                raise ValueError(
+                    f"requests[{index}] 必须是字段映射，收到 "
+                    f"{type(raw).__name__}"
+                )
+            if "currency" in raw and raw["currency"] is not None:
+                request_currency = raw["currency"]
+                if (
+                    not isinstance(request_currency, str)
+                    or not request_currency.strip()
+                ):
+                    raise InvalidCurrencyError(
+                        f"requests[{index}] 币种为空"
+                    )
+                if request_currency.strip() != currency:
+                    raise MixedCurrencyError(
+                        f"批次币种 {currency} 与 requests[{index}] 币种 "
+                        f"{request_currency.strip()} 不一致"
+                    )
+            if "pool_balance" in raw:
+                raise ValueError(
+                    f"requests[{index}] 不得携带 pool_balance："
+                    f"批量结算使用批次滚动余额"
+                )
+            try:
+                request = self._validate(
+                    transaction_id=raw["transaction_id"],
+                    currency=currency,
+                    pool_balance=opening,
+                    settlement_amount=raw["settlement_amount"],
+                    notional_exposure=raw["notional_exposure"],
+                    base_limit=raw["base_limit"],
+                    risk_factor=raw["risk_factor"],
+                    creditors=raw["creditors"],
+                    supplementary_capital=raw.get(
+                        "supplementary_capital", _ZERO
+                    ),
+                    seen=pending_seen,
+                )
+            except KeyError as exc:
+                raise ValueError(
+                    f"requests[{index}] 缺少必填字段: {exc.args[0]}"
+                ) from None
+            validated.append(request)
+
+        # 整批校验通过：一次性提交全部流水号（异常路径不会执行到这里，
+        # 故引擎状态在任何校验失败时保持原样）。
+        self._seen_transactions.update(
+            request.transaction_id for request in validated
+        )
+
+        # 第三层：按序以滚动余额执行限额与清算，逐笔追加审计事件。
+        results: list[SettlementResult] = []
+        rolling_balance = opening
+        for request in validated:
+            # 每笔看到的 pool_balance 为当前滚动余额；结果与事件中的
+            # validated_available_balance 即该笔处理完后的即时余额。
+            current = self._with_pool_balance(request, rolling_balance)
+            risk_occupancy = (
+                current.settlement_amount
+                + current.notional_exposure * current.risk_factor
+            )
+            if current.settlement_amount > current.pool_balance:
+                result = self._build_rejected(
+                    current,
+                    risk_occupancy,
+                    "SETTLEMENT_EXCEEDS_AVAILABLE_BALANCE",
+                )
+            elif risk_occupancy > current.base_limit:
+                result = self._build_rejected(
+                    current,
+                    risk_occupancy,
+                    "RISK_OCCUPANCY_EXCEEDS_BASE_LIMIT",
+                )
+            else:
+                result = self._settle(current, risk_occupancy)
+
+            self._append_audit(current, result)
+            results.append(result)
+            rolling_balance = result.validated_available_balance
+
+        event_ids = tuple(result.event_id for result in results)
+        return BatchSettlementResult(
+            results=tuple(results),
+            event_ids=event_ids,
+            validated_available_balance=rolling_balance,
+        )
+
+    @staticmethod
+    def _with_pool_balance(
+        request: SettlementRequest, pool_balance: Decimal
+    ) -> SettlementRequest:
+        """返回把池余额替换为滚动余额的请求副本，其余字段不变。"""
+        if request.pool_balance == pool_balance:
+            return request
+        return SettlementRequest(
+            transaction_id=request.transaction_id,
+            currency=request.currency,
+            pool_balance=pool_balance,
+            settlement_amount=request.settlement_amount,
+            notional_exposure=request.notional_exposure,
+            base_limit=request.base_limit,
+            risk_factor=request.risk_factor,
+            creditors=request.creditors,
+            supplementary_capital=request.supplementary_capital,
+        )
+
+    # ------------------------------------------------------------------ #
     # 输入校验（不静默修正；异常路径不产生任何状态变更）
     # ------------------------------------------------------------------ #
 
@@ -180,12 +350,23 @@ class ClearingEngine:
         risk_factor: Number,
         creditors: Iterable[Mapping[str, object] | Creditor | tuple[str, Number]],
         supplementary_capital: Number,
+        seen: set[str] | None = None,
     ) -> SettlementRequest:
+        """校验并归一化单笔请求。
+
+        ``seen`` 为 ``None`` 时是单笔入口语义：重复判定基于台账，校验通过
+        后立即提交流水号（历史行为不变）。批量入口传入"台账 ∪ 批内暂存"
+        的集合做重复判定，但不触碰引擎状态；批内流水号由
+        :meth:`process_batch` 在整批校验通过后统一提交，保证失败批整体
+        回退、不占用任何流水号。
+        """
         if not isinstance(transaction_id, str) or not transaction_id.strip():
             raise ValueError("transaction_id 必须是非空字符串")
 
         # 重复流水号：在任何归一化/状态变更之前判定。
-        if transaction_id in self._seen_transactions:
+        committed = self._seen_transactions
+        dedupe = committed if seen is None else seen
+        if transaction_id in dedupe:
             raise DuplicateTransactionError(
                 f"重复的业务流水号: {transaction_id}"
             )
@@ -226,8 +407,12 @@ class ClearingEngine:
             supplementary_capital=capital,
         )
 
-        # 校验全部通过后才登记流水号：保证异常路径不产生半成品状态。
-        self._seen_transactions.add(transaction_id)
+        # 单笔入口（seen is None）沿用即时登记；批量入口不在这里提交，
+        # 由 process_batch 在整批校验通过后一次性登记，失败批整体回退。
+        if seen is None:
+            self._seen_transactions.add(transaction_id)
+        else:
+            seen.add(transaction_id)
         return request
 
     @staticmethod
@@ -460,4 +645,22 @@ def process_settlement(
         risk_factor=risk_factor,
         creditors=creditors,
         supplementary_capital=supplementary_capital,
+    )
+
+
+def process_settlement_batch(
+    currency: str,
+    opening_pool_balance: Number,
+    requests: Sequence[Mapping[str, object]],
+) -> BatchSettlementResult:
+    """模块级便捷入口：用一次性引擎实例处理一整批请求并返回结果。
+
+    参数与返回结构同 :meth:`ClearingEngine.process_batch`；批次之间不保留
+    台账与去重状态（即不跨批次去重）。需要复用审计台账与流水号去重时，
+    请直接使用 :class:`ClearingEngine`。
+    """
+    return ClearingEngine().process_batch(
+        currency=currency,
+        opening_pool_balance=opening_pool_balance,
+        requests=requests,
     )
