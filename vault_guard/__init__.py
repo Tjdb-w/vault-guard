@@ -2,15 +2,18 @@
 
 公开 API：
 
-- :class:`ClearingEngine` / :func:`process_settlement`：清算入口；
+- :class:`ClearingEngine` / :func:`process_settlement`：单笔清算入口；
+- :meth:`ClearingEngine.process_batch` / :func:`process_settlement_batch`：
+  同一币种的多笔批次结算入口；
 - :class:`~vault_guard.models.SettlementRequest` 等数据模型；
 - :mod:`vault_guard.errors` 中定义的各类异常（负数使用内建
   :class:`ValueError`）。
 """
 
-from .engine import ClearingEngine, process_settlement
+from .engine import ClearingEngine, process_settlement, process_settlement_batch
 from .errors import (
     DuplicateTransactionError,
+    EmptyBatchError,
     EmptyCreditorListError,
     InvalidCurrencyError,
     InvalidRiskFactorError,
@@ -19,6 +22,7 @@ from .errors import (
 )
 from .models import (
     AuditEvent,
+    BatchSettlementResult,
     Creditor,
     CreditorAttribution,
     SettlementRequest,
@@ -28,8 +32,10 @@ from .models import (
 __all__ = [
     "ClearingEngine",
     "process_settlement",
+    "process_settlement_batch",
     "SettlementRequest",
     "SettlementResult",
+    "BatchSettlementResult",
     "Creditor",
     "CreditorAttribution",
     "AuditEvent",
@@ -39,6 +45,7 @@ __all__ = [
     "EmptyCreditorListError",
     "InvalidRiskFactorError",
     "MixedCurrencyError",
+    "EmptyBatchError",
 ]
 
 __version__ = "0.1.0"

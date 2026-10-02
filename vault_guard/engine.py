@@ -1,9 +1,11 @@
 """清算风控引擎：限额校验、清算瀑布、坏账归因与内存审计台账。
 
 公开入口为 :meth:`ClearingEngine.process`（模块级便捷函数
-:func:`process_settlement` 内部也持有自己的引擎实例）。
+:func:`process_settlement` 内部也持有自己的引擎实例）与
+:meth:`ClearingEngine.process_batch`（模块级 :func:`process_settlement_batch`
+同样使用一次性引擎，不跨批次去重）。
 
-处理严格按确定顺序执行：
+单笔处理严格按确定顺序执行：
 
 1. 输入校验（负数 / 币种 / 系数 / 债权清单 / 流水号去重）。
 2. 限额校验：风险占用 = 拟清算金额 + 名义敞口 × 风险系数。
@@ -11,16 +13,23 @@
 4. 补充资本按清单顺序补足仍未受偿的债权。
 5. 归因并追加恰好一条审计事件。
 
+批次处理在同一币种下按请求顺序以滚动余额逐笔执行上述规则：批次先做整体
+校验（空批次 / 币种 / 债权币种 / 流水号去重），校验失败不生成事件、不占
+流水号、不改余额并回退批内状态；校验通过后逐笔限额校验与清算，通过请求
+各追加一条现有结构事件，批次本身不建事件。
+
 校验异常不产生任何分配，也不写入台账；重复流水号在任何状态变更之前抛出。
 """
 
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import replace
 from decimal import Decimal, InvalidOperation
 from math import isfinite
 from typing import Union
 
 from .errors import (
     DuplicateTransactionError,
+    EmptyBatchError,
     EmptyCreditorListError,
     InvalidCurrencyError,
     InvalidRiskFactorError,
@@ -28,13 +37,14 @@ from .errors import (
 )
 from .models import (
     AuditEvent,
+    BatchSettlementResult,
     Creditor,
     CreditorAttribution,
     SettlementRequest,
     SettlementResult,
 )
 
-__all__ = ["ClearingEngine", "process_settlement"]
+__all__ = ["ClearingEngine", "process_settlement", "process_settlement_batch"]
 
 Number = Union[int, float, Decimal]
 
@@ -144,7 +154,71 @@ class ClearingEngine:
             creditors=creditors,
             supplementary_capital=supplementary_capital,
         )
+        return self._execute(request)
 
+    def process_batch(
+        self,
+        currency: str,
+        opening_pool_balance: Number,
+        requests: Iterable[Mapping[str, object]],
+    ) -> BatchSettlementResult:
+        """处理同一币种的多笔结算批次，返回不可变 :class:`BatchSettlementResult`。
+
+        - ``currency``：批次币种，适用于批次内全部请求。
+        - ``opening_pool_balance``：批次期初资金池余额；各请求的
+          ``pool_balance`` 取滚动余额（上一笔执行后的可用余额）。
+        - ``requests``：请求映射序列，每项字段沿用 :meth:`process`
+          （``transaction_id`` / ``settlement_amount`` / ``notional_exposure``
+          / ``base_limit`` / ``risk_factor`` / ``creditors``，以及可选的
+          ``supplementary_capital``，默认 0）；``currency`` 与
+          ``pool_balance`` 不在单项内指定。
+
+        批次先做整体校验：空批次、缺币种、债权币种不一致、流水号批内或与
+        台账重复依次抛出 :class:`EmptyBatchError`、
+        :class:`InvalidCurrencyError`、:class:`MixedCurrencyError`、
+        :class:`DuplicateTransactionError`；空债权清单与风险系数越界抛出
+        :class:`EmptyCreditorListError` 与 :class:`InvalidRiskFactorError`；
+        错误数值抛内建 :class:`ValueError`。校验失败不生成事件、不占流水号、
+        不改余额，并回退批内已产生的全部状态。
+
+        校验通过后按请求顺序以滚动余额逐笔执行限额校验与清算；通过请求各
+        追加一条现有结构事件（序号递增），批次本身不建事件。
+        """
+        currency, opening, normalized = self._validate_batch(
+            currency, opening_pool_balance, requests
+        )
+
+        # 执行阶段基于已校验数据不会失败；仍防御性回滚，保证异常路径下
+        # 事件、序号、流水号与结果索引全部复原。
+        events_mark = len(self._events)
+        sequence_mark = self._sequence
+        added_ids: list[str] = []
+        results: list[SettlementResult] = []
+        balance = opening
+        try:
+            for request in normalized:
+                request = replace(request, pool_balance=balance)
+                self._seen_transactions.add(request.transaction_id)
+                added_ids.append(request.transaction_id)
+                result = self._execute(request)
+                results.append(result)
+                balance = result.validated_available_balance
+        except Exception:
+            del self._events[events_mark:]
+            self._sequence = sequence_mark
+            for tid in added_ids:
+                self._seen_transactions.discard(tid)
+                self._results.pop(tid, None)
+            raise
+
+        return BatchSettlementResult(
+            results=tuple(results),
+            event_ids=tuple(result.event_id for result in results),
+            validated_available_balance=balance,
+        )
+
+    def _execute(self, request: SettlementRequest) -> SettlementResult:
+        """对已校验请求执行限额校验、清算与审计追加。"""
         # 限额校验。拒绝时余额不变、无任何分配。
         risk_occupancy = (
             request.settlement_amount
@@ -289,6 +363,113 @@ class ClearingEngine:
         if not creditors:
             raise EmptyCreditorListError("优先债权清单为空")
         return creditors
+
+    # ------------------------------------------------------------------ #
+    # 批次校验（整体校验通过后才开始任何状态变更）
+    # ------------------------------------------------------------------ #
+
+    def _validate_batch(
+        self,
+        currency: str,
+        opening_pool_balance: Number,
+        requests: Iterable[Mapping[str, object]],
+    ) -> tuple[str, Decimal, list[SettlementRequest]]:
+        if requests is None:
+            raise EmptyBatchError("批次请求清单为空")
+        try:
+            items = list(requests)
+        except TypeError:
+            raise EmptyBatchError("批次请求清单为空") from None
+        if not items:
+            raise EmptyBatchError("批次请求清单为空")
+
+        if not isinstance(currency, str) or not currency.strip():
+            raise InvalidCurrencyError("账户币种缺失或为空")
+        currency = currency.strip()
+
+        opening = _as_decimal(opening_pool_balance, "opening_pool_balance")
+        _check_non_negative(opening, "opening_pool_balance")
+
+        # 逐请求归一化（不含流水号去重）：数值 / 系数 / 债权币种错误在此抛出。
+        normalized = [
+            self._normalize_batch_item(item, index, currency, opening)
+            for index, item in enumerate(items)
+        ]
+
+        # 重复流水号最后统一判定：批内互相重复或与台账重复均拒绝。
+        seen_in_batch: set[str] = set()
+        for request in normalized:
+            tid = request.transaction_id
+            if tid in seen_in_batch or tid in self._seen_transactions:
+                raise DuplicateTransactionError(
+                    f"重复的业务流水号: {tid}"
+                )
+            seen_in_batch.add(tid)
+
+        return currency, opening, normalized
+
+    def _normalize_batch_item(
+        self,
+        item: object,
+        index: int,
+        currency: str,
+        opening_pool_balance: Decimal,
+    ) -> SettlementRequest:
+        """归一化批次中的单个请求映射；``pool_balance`` 暂存期初余额，
+        执行时替换为滚动余额。"""
+        if not isinstance(item, Mapping):
+            raise ValueError(
+                f"requests[{index}] 必须是字段映射，收到 "
+                f"{type(item).__name__}"
+            )
+
+        transaction_id = item.get("transaction_id")
+        if not isinstance(transaction_id, str) or not transaction_id.strip():
+            raise ValueError("transaction_id 必须是非空字符串")
+
+        amount = _as_decimal(
+            item.get("settlement_amount"), f"requests[{index}].settlement_amount"
+        )
+        exposure = _as_decimal(
+            item.get("notional_exposure"),
+            f"requests[{index}].notional_exposure",
+        )
+        limit = _as_decimal(
+            item.get("base_limit"), f"requests[{index}].base_limit"
+        )
+        factor = _as_decimal(
+            item.get("risk_factor"), f"requests[{index}].risk_factor"
+        )
+        capital = _as_decimal(
+            item.get("supplementary_capital", _ZERO),
+            f"requests[{index}].supplementary_capital",
+        )
+
+        _check_non_negative(amount, f"requests[{index}].settlement_amount")
+        _check_non_negative(exposure, f"requests[{index}].notional_exposure")
+        _check_non_negative(limit, f"requests[{index}].base_limit")
+        _check_non_negative(capital, f"requests[{index}].supplementary_capital")
+
+        if factor < _ZERO or factor > _ONE:
+            raise InvalidRiskFactorError(
+                f"风险系数必须落在 [0, 1]，收到 {factor}"
+            )
+
+        creditor_list = self._normalize_creditors(
+            item.get("creditors"), currency
+        )
+
+        return SettlementRequest(
+            transaction_id=transaction_id,
+            currency=currency,
+            pool_balance=opening_pool_balance,
+            settlement_amount=amount,
+            notional_exposure=exposure,
+            base_limit=limit,
+            risk_factor=factor,
+            creditors=tuple(creditor_list),
+            supplementary_capital=capital,
+        )
 
     # ------------------------------------------------------------------ #
     # 清算瀑布与归因
@@ -460,4 +641,21 @@ def process_settlement(
         risk_factor=risk_factor,
         creditors=creditors,
         supplementary_capital=supplementary_capital,
+    )
+
+
+def process_settlement_batch(
+    currency: str,
+    opening_pool_balance: Number,
+    requests: Iterable[Mapping[str, object]],
+) -> BatchSettlementResult:
+    """模块级便捷入口：用一次性引擎实例处理整个批次并返回结果。
+
+    不保留跨批次的台账与流水号去重状态；需要复用时请直接使用
+    :class:`ClearingEngine` 的 :meth:`~ClearingEngine.process_batch`。
+    """
+    return ClearingEngine().process_batch(
+        currency=currency,
+        opening_pool_balance=opening_pool_balance,
+        requests=requests,
     )

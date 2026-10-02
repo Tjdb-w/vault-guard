@@ -7,8 +7,9 @@
 本仓库从零开始实现上述方向的可用工具，不依赖外部同类实现，仅使用 Python
 标准库（要求 Python 3.10+）。
 
-当前版本兼容范围限定为**同一币种的单笔结算请求**：多币种换算与外部定价不
-在范围内；单笔请求内出现混合币种直接抛出 `MixedCurrencyError`。无任何落盘
+当前版本兼容范围限定为**同一币种**的结算请求：单笔走 `process`，多笔批次
+走 `process_batch`（批次内共享币种与滚动余额）；多币种换算与外部定价不
+在范围内，请求内出现混合币种直接抛出 `MixedCurrencyError`。无任何落盘
 行为，审计台账以内存中的追加式序列表示。
 
 ## 公开入口
@@ -44,6 +45,53 @@ result = engine.process(
 需要一次性处理时可使用模块级便捷函数
 `vault_guard.process_settlement(...)`（参数与返回结构相同，但不保留跨请求
 台账与去重状态）。
+
+## 多笔批次结算
+
+`ClearingEngine.process_batch(currency, opening_pool_balance, requests)` 在
+同一币种下按请求顺序处理多笔结算：
+
+```python
+batch = engine.process_batch(
+    currency="USD",                    # 批次币种，适用于全部请求
+    opening_pool_balance=Decimal("100"),  # 批次期初资金池余额
+    requests=[
+        {   # 字段沿用 process（不含 currency / pool_balance）
+            "transaction_id": "TX-101",
+            "settlement_amount": Decimal("40"),
+            "notional_exposure": Decimal("0"),
+            "base_limit": Decimal("100"),
+            "risk_factor": Decimal("0"),
+            "creditors": [("senior", Decimal("60"))],
+            "supplementary_capital": Decimal("0"),  # 可选，默认 0
+        },
+        # ... 后续请求
+    ],
+)
+```
+
+- 各请求的 `pool_balance` 取**滚动余额**：从 `opening_pool_balance` 开始，
+  每笔执行后的可用余额即下一笔的输入余额；拒绝的请求不改余额。
+- 批次先做整体校验，随后按序逐笔执行限额校验与清算；每个过校验请求
+  （放行或拒绝）追加一条现有结构审计事件，序号递增，批次本身不建事件。
+- 校验失败（异常）不生成事件、不占流水号、不改余额，并回退批内已产生
+  的全部状态，修正后可整体重提。
+- 异常顺序：空批次 → `EmptyBatchError`；缺币种 → `InvalidCurrencyError`；
+  债权币种不一致 → `MixedCurrencyError`；流水号批内或与台账重复 →
+  `DuplicateTransactionError`；空债权清单 / 风险系数越界 →
+  `EmptyCreditorListError` / `InvalidRiskFactorError`；错误数值 →
+  `ValueError`。
+
+返回不可变的 `BatchSettlementResult`：
+
+| 字段 | 含义 |
+| --- | --- |
+| `results` | 与 `requests` 同序的 `SettlementResult` 元组；每笔的 `validated_available_balance` 为该笔执行后的即时余额 |
+| `event_ids` | 与 `results` 同序的审计事件标识 |
+| `validated_available_balance` | 批次全部执行后的最终可用余额 |
+
+模块级 `vault_guard.process_settlement_batch(currency,
+opening_pool_balance, requests)` 使用一次性引擎返回结果，不跨批次去重。
 
 ## 处理规则（确定顺序）
 
@@ -90,6 +138,7 @@ result = engine.process(
 | 空债权清单 | `vault_guard.EmptyCreditorListError` |
 | 风险系数越界（< 0 或 > 1） | `vault_guard.InvalidRiskFactorError` |
 | 单笔请求内混合币种 | `vault_guard.MixedCurrencyError` |
+| 空批次请求清单 | `vault_guard.EmptyBatchError` |
 
 校验异常不产生任何半成品分配，也不写入审计台账；失败请求的流水号不被占用，
 可在修正后用同一流水号重新提交。

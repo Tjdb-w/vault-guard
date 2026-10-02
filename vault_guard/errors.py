@@ -8,6 +8,7 @@
 - 空债权清单 -> :class:`EmptyCreditorListError`
 - 风险系数越界 -> :class:`InvalidRiskFactorError`
 - 混合币种 -> :class:`MixedCurrencyError`
+- 空批次 -> :class:`EmptyBatchError`
 """
 
 __all__ = [
@@ -17,6 +18,7 @@ __all__ = [
     "EmptyCreditorListError",
     "InvalidRiskFactorError",
     "MixedCurrencyError",
+    "EmptyBatchError",
 ]
 
 
@@ -42,3 +44,7 @@ class InvalidRiskFactorError(VaultGuardError):
 
 class MixedCurrencyError(VaultGuardError):
     """单笔结算请求内出现混合币种。"""
+
+
+class EmptyBatchError(VaultGuardError):
+    """批次请求清单为空。"""
