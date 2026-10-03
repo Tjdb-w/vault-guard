@@ -7,6 +7,8 @@
   同一币种的多笔批次结算入口；
 - :meth:`ClearingEngine.process_risk_group_batch` /
   :func:`process_settlement_risk_group_batch`：带风险组累计限额的批次入口；
+- :meth:`ClearingEngine.process_recovery`：存续坏账回收入口（回收依赖台账
+  状态，仅提供引擎方法，无模块级一次性入口）；
 - :class:`~vault_guard.models.SettlementRequest` 等数据模型；
 - :mod:`vault_guard.errors` 中定义的各类异常（负数使用内建
   :class:`ValueError`）。
@@ -26,6 +28,8 @@ from .errors import (
     InvalidRiskFactorError,
     InvalidRiskGroupError,
     MixedCurrencyError,
+    NoOutstandingBadDebtError,
+    RecoveryAmountExceedsOutstandingError,
     VaultGuardError,
 )
 from .models import (
@@ -33,6 +37,9 @@ from .models import (
     BatchSettlementResult,
     Creditor,
     CreditorAttribution,
+    OutstandingBadDebt,
+    RecoveryAllocation,
+    RecoveryResult,
     RiskGroupBatchResult,
     RiskGroupUsage,
     SettlementRequest,
@@ -49,6 +56,9 @@ __all__ = [
     "BatchSettlementResult",
     "RiskGroupUsage",
     "RiskGroupBatchResult",
+    "RecoveryAllocation",
+    "RecoveryResult",
+    "OutstandingBadDebt",
     "Creditor",
     "CreditorAttribution",
     "AuditEvent",
@@ -60,6 +70,8 @@ __all__ = [
     "MixedCurrencyError",
     "EmptyBatchError",
     "InvalidRiskGroupError",
+    "NoOutstandingBadDebtError",
+    "RecoveryAmountExceedsOutstandingError",
 ]
 
 __version__ = "0.1.0"

@@ -110,6 +110,31 @@ opening_pool_balance, requests)` 使用一次性引擎返回结果，不跨批�
    给出每笔债权的池内分配、资本承担与坏账金额，逐项坏账合计恒等于未覆盖
    坏账，且对每笔债权满足 `池内 + 资本 + 坏账 = 债权金额`。
 
+## 存续坏账回收
+
+已放行结算留下的未覆盖债权进入存续坏账台账，可用
+`ClearingEngine.process_recovery(recovery_transaction_id, currency,
+recovery_amount)` 提交回收（回收依赖台账状态，仅提供引擎方法）：
+
+```python
+recovery = engine.process_recovery("RC-001", "USD", Decimal("25"))
+```
+
+- 冲减顺序：先按审计事件顺序、再按债权清单顺序，只冲减币种相符且仍有
+  坏账的债权；前项清零后处理后项，一笔回收可部分覆盖单项坏账。
+- 返回不可变 `RecoveryResult`：回收流水号、币种、回收额、按冲减顺序排列
+  的 `RecoveryAllocation`（来源结算流水号、债权名、本次冲减、剩余坏账）、
+  回收合计、回收后该币种存续坏账与事件标识。
+- 历史 `SettlementResult` 不回写；回收成功追加一条标识为
+  `EVT-{recovery_transaction_id}-recovery` 的审计事件（序号继续递增，
+  `recovery_allocations` 保存同额明细；结算事件该字段恒为空元组）。
+- 有坏账时零额回收生成一条空明细事件；失败（重复流水号 / 缺币种 / 非法
+  金额 / 无存续坏账 / 超额）不生成事件、不占流水号、不改状态。
+- 只读查询不触发清算：`engine.recovery_of(recovery_transaction_id)` 返回
+  `RecoveryResult` 或 `None`；`engine.outstanding_bad_debts(currency)`
+  按台账顺序返回该币种剩余明细（来源流水号、债权名、币种、余额），其他
+  币种不受影响。
+
 ## 返回结构
 
 成功与拒绝路径使用同构的 `SettlementResult`：
@@ -139,6 +164,8 @@ opening_pool_balance, requests)` 使用一次性引擎返回结果，不跨批�
 | 风险系数越界（< 0 或 > 1） | `vault_guard.InvalidRiskFactorError` |
 | 单笔请求内混合币种 | `vault_guard.MixedCurrencyError` |
 | 空批次请求清单 | `vault_guard.EmptyBatchError` |
+| 回收币种无存续坏账（含此时零额回收） | `vault_guard.NoOutstandingBadDebtError` |
+| 回收额超过该币种存续坏账 | `vault_guard.RecoveryAmountExceedsOutstandingError` |
 
 校验异常不产生任何半成品分配，也不写入审计台账；失败请求的流水号不被占用，
 可在修正后用同一流水号重新提交。
@@ -150,6 +177,8 @@ opening_pool_balance, requests)` 使用一次性引擎返回结果，不跨批�
 - 事件包含流水号、输入摘要、校验结果、风险占用、各层分配与最终未覆盖金额。
 - 只读查询不触发清算：`engine.audit_log`（快照）、`engine.events()`、
   `engine.get_event(transaction_id)`、`engine.result_of(transaction_id)`、
+  `engine.recovery_of(recovery_transaction_id)`、
+  `engine.outstanding_bad_debts(currency)`、
   `engine.has_transaction(transaction_id)`。
 
 ## 测试

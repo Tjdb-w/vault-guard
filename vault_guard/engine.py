@@ -27,11 +27,19 @@
 已用额度），生成现有结构审计事件并继续处理后续请求。不带风险组的请求仍
 只按单笔基础限额处理。
 
+存续坏账回收（:meth:`ClearingEngine.process_recovery`）只冲减已放行结算
+留下的未覆盖债权：按审计事件顺序、再按债权清单顺序逐项冲减币种相符且仍
+有坏账的债权，前项清零后处理后项，一笔回收可部分覆盖；历史
+:class:`SettlementResult` 不回写。回收成功追加一条标识为
+``EVT-{recovery_transaction_id}-recovery`` 的审计事件（序号继续递增，
+``recovery_allocations`` 保存同额明细），失败不生成事件、不占流水号、
+不改状态。
+
 校验异常不产生任何分配，也不写入台账；重复流水号在任何状态变更之前抛出。
 """
 
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 from math import isfinite
 from types import MappingProxyType
@@ -45,12 +53,17 @@ from .errors import (
     InvalidRiskFactorError,
     InvalidRiskGroupError,
     MixedCurrencyError,
+    NoOutstandingBadDebtError,
+    RecoveryAmountExceedsOutstandingError,
 )
 from .models import (
     AuditEvent,
     BatchSettlementResult,
     Creditor,
     CreditorAttribution,
+    OutstandingBadDebt,
+    RecoveryAllocation,
+    RecoveryResult,
     RiskGroupBatchResult,
     RiskGroupUsage,
     SettlementRequest,
@@ -68,6 +81,19 @@ Number = Union[int, float, Decimal]
 
 _ZERO = Decimal(0)
 _ONE = Decimal(1)
+
+
+@dataclass
+class _BadDebtEntry:
+    """存续坏账台账中的一笔内部记录（引擎私有，可变）。
+
+    按审计事件追加顺序、再按债权清单顺序排列；``remaining`` 随回收冲减。
+    """
+
+    source_transaction_id: str
+    creditor: str
+    currency: str
+    remaining: Decimal
 
 
 def _as_decimal(value: object, field: str) -> Decimal:
@@ -101,7 +127,8 @@ class ClearingEngine:
     """金库清算风控引擎。
 
     审计台账为实例内内存中的追加式序列（``self.audit_log``），只读查询
-    （:meth:`get_event` / :meth:`events` / :meth:`result_of`）不触发清算。
+    （:meth:`get_event` / :meth:`events` / :meth:`result_of` /
+    :meth:`recovery_of` / :meth:`outstanding_bad_debts`）不触发清算。
     """
 
     def __init__(self) -> None:
@@ -112,6 +139,9 @@ class ClearingEngine:
         # 风险组登记上限与累计已用额度，跨批次保留。
         self._risk_group_limits: dict[str, Decimal] = {}
         self._risk_group_used: dict[str, Decimal] = {}
+        # 存续坏账台账（按事件顺序追加）与已登记回收结果。
+        self._bad_debt_ledger: list[_BadDebtEntry] = []
+        self._recoveries: dict[str, RecoveryResult] = {}
 
     # ------------------------------------------------------------------ #
     # 只读查询（不触发清算，不改变任何状态）
@@ -136,6 +166,30 @@ class ClearingEngine:
     def result_of(self, transaction_id: str) -> SettlementResult | None:
         """按流水号读取已有处理结果；不存在返回 None。"""
         return self._results.get(transaction_id)
+
+    def recovery_of(self, recovery_transaction_id: str) -> RecoveryResult | None:
+        """按回收流水号读取已有回收结果；不存在返回 None，不触发清算。"""
+        return self._recoveries.get(recovery_transaction_id)
+
+    def outstanding_bad_debts(self, currency: str) -> tuple[OutstandingBadDebt, ...]:
+        """按台账顺序返回该币种仍有余额的存续坏账明细；不触发清算。
+
+        逐项含来源结算流水号、债权名、币种与剩余余额；该币种无存续坏账
+        时返回空元组，其他币种不受影响。
+        """
+        if not isinstance(currency, str):
+            return ()
+        currency = currency.strip()
+        return tuple(
+            OutstandingBadDebt(
+                source_transaction_id=entry.source_transaction_id,
+                creditor=entry.creditor,
+                currency=entry.currency,
+                balance=entry.remaining,
+            )
+            for entry in self._bad_debt_ledger
+            if entry.currency == currency and entry.remaining > _ZERO
+        )
 
     def has_transaction(self, transaction_id: str) -> bool:
         return transaction_id in self._seen_transactions
@@ -210,9 +264,10 @@ class ClearingEngine:
         )
 
         # 执行阶段基于已校验数据不会失败；仍防御性回滚，保证异常路径下
-        # 事件、序号、流水号与结果索引全部复原。
+        # 事件、序号、流水号、结果索引与坏账台账全部复原。
         events_mark = len(self._events)
         sequence_mark = self._sequence
+        ledger_mark = len(self._bad_debt_ledger)
         added_ids: list[str] = []
         results: list[SettlementResult] = []
         balance = opening
@@ -227,6 +282,7 @@ class ClearingEngine:
         except Exception:
             del self._events[events_mark:]
             self._sequence = sequence_mark
+            del self._bad_debt_ledger[ledger_mark:]
             for tid in added_ids:
                 self._seen_transactions.discard(tid)
                 self._results.pop(tid, None)
@@ -273,11 +329,12 @@ class ClearingEngine:
         )
 
         # 执行阶段基于已校验数据不会失败；仍防御性回滚，保证异常路径下
-        # 事件、序号、流水号、结果索引与风险组状态全部复原。
+        # 事件、序号、流水号、结果索引、风险组状态与坏账台账全部复原。
         events_mark = len(self._events)
         sequence_mark = self._sequence
         limits_mark = dict(self._risk_group_limits)
         used_mark = dict(self._risk_group_used)
+        ledger_mark = len(self._bad_debt_ledger)
         added_ids: list[str] = []
         results: list[SettlementResult] = []
         balance = opening
@@ -297,6 +354,7 @@ class ClearingEngine:
             self._sequence = sequence_mark
             self._risk_group_limits = limits_mark
             self._risk_group_used = used_mark
+            del self._bad_debt_ledger[ledger_mark:]
             for tid in added_ids:
                 self._seen_transactions.discard(tid)
                 self._results.pop(tid, None)
@@ -317,6 +375,100 @@ class ClearingEngine:
                 }
             ),
         )
+
+    def process_recovery(
+        self,
+        recovery_transaction_id: str,
+        currency: str,
+        recovery_amount: Number,
+    ) -> RecoveryResult:
+        """提交一笔存续坏账回收，返回不可变 :class:`RecoveryResult`。
+
+        只冲减已放行结算留下的未覆盖债权：按审计事件顺序、再按债权清单
+        顺序逐项冲减币种相符且仍有坏账的债权，前项清零后处理后项，一笔
+        回收可部分覆盖单项坏账。历史 :class:`SettlementResult` 不回写。
+
+        - 重复回收流水号抛 :class:`DuplicateTransactionError`；
+        - 缺币种抛 :class:`InvalidCurrencyError`；
+        - 负数、NaN、无穷或非数值回收额抛内建 :class:`ValueError`；
+        - 该币种无存续坏账（含此时零额回收）抛
+          :class:`NoOutstandingBadDebtError`；
+        - 回收额超过该币种存续坏账总额抛
+          :class:`RecoveryAmountExceedsOutstandingError`。
+
+        失败不生成事件、不占流水号、不改状态。有坏账时零额回收生成一条
+        空明细事件，标识为 ``EVT-{recovery_transaction_id}-recovery``，
+        审计序号继续递增。
+        """
+        if not isinstance(recovery_transaction_id, str) or not recovery_transaction_id.strip():
+            raise ValueError("recovery_transaction_id 必须是非空字符串")
+
+        # 重复流水号：在任何归一化/状态变更之前判定。
+        if recovery_transaction_id in self._seen_transactions:
+            raise DuplicateTransactionError(
+                f"重复的业务流水号: {recovery_transaction_id}"
+            )
+
+        if not isinstance(currency, str) or not currency.strip():
+            raise InvalidCurrencyError("账户币种缺失或为空")
+        currency = currency.strip()
+
+        amount = _as_decimal(recovery_amount, "recovery_amount")
+        _check_non_negative(amount, "recovery_amount")
+
+        outstanding_total = sum(
+            (
+                entry.remaining
+                for entry in self._bad_debt_ledger
+                if entry.currency == currency
+            ),
+            _ZERO,
+        )
+        if outstanding_total <= _ZERO:
+            raise NoOutstandingBadDebtError(
+                f"币种 {currency} 无存续坏账可回收"
+            )
+        if amount > outstanding_total:
+            raise RecoveryAmountExceedsOutstandingError(
+                f"回收额 {amount} 超过币种 {currency} 存续坏账 {outstanding_total}"
+            )
+
+        # 校验全部通过后才登记流水号并执行冲减。
+        self._seen_transactions.add(recovery_transaction_id)
+
+        remaining = amount
+        allocations: list[RecoveryAllocation] = []
+        for entry in self._bad_debt_ledger:
+            if remaining <= _ZERO:
+                break
+            if entry.currency != currency or entry.remaining <= _ZERO:
+                continue
+            write_down = min(entry.remaining, remaining)
+            entry.remaining -= write_down
+            remaining -= write_down
+            allocations.append(
+                RecoveryAllocation(
+                    source_transaction_id=entry.source_transaction_id,
+                    creditor=entry.creditor,
+                    recovered_amount=write_down,
+                    remaining_bad_debt=entry.remaining,
+                )
+            )
+
+        outstanding_after = outstanding_total - amount
+        event_id = f"EVT-{recovery_transaction_id}-recovery"
+        result = RecoveryResult(
+            recovery_transaction_id=recovery_transaction_id,
+            currency=currency,
+            recovery_amount=amount,
+            allocations=tuple(allocations),
+            total_recovered=amount - remaining,
+            outstanding_bad_debt=outstanding_after,
+            event_id=event_id,
+        )
+        self._append_recovery_audit(result)
+        self._recoveries[recovery_transaction_id] = result
+        return result
 
     def _execute(self, request: SettlementRequest) -> SettlementResult:
         """对已校验请求执行限额校验、清算与审计追加。"""
@@ -832,6 +984,52 @@ class ClearingEngine:
         )
         self._events.append(event)
         self._results[request.transaction_id] = result
+        if result.approved:
+            # 已放行结算的未覆盖债权进入存续坏账台账，供后续回收冲减；
+            # 台账顺序即审计事件顺序 + 债权清单顺序。
+            for attribution in result.attributions:
+                if attribution.bad_debt > _ZERO:
+                    self._bad_debt_ledger.append(
+                        _BadDebtEntry(
+                            source_transaction_id=request.transaction_id,
+                            creditor=attribution.creditor,
+                            currency=request.currency,
+                            remaining=attribution.bad_debt,
+                        )
+                    )
+
+    def _append_recovery_audit(self, result: RecoveryResult) -> None:
+        """为回收结果追加一条审计事件；结算专属字段按回收语义置空。"""
+        self._sequence += 1
+        event = AuditEvent(
+            event_id=result.event_id,
+            sequence=self._sequence,
+            transaction_id=result.recovery_transaction_id,
+            approved=True,
+            currency=result.currency,
+            input_summary={
+                "recovery_transaction_id": result.recovery_transaction_id,
+                "currency": result.currency,
+                "recovery_amount": result.recovery_amount,
+            },
+            validation_result="RECOVERY",
+            risk_occupancy=_ZERO,
+            pool_allocations=(),
+            capital_allocations=(),
+            uncovered_bad_debt=result.outstanding_bad_debt,
+            validated_available_balance=_ZERO,
+            rejection_reason=None,
+            recovery_allocations=tuple(
+                (
+                    allocation.source_transaction_id,
+                    allocation.creditor,
+                    allocation.recovered_amount,
+                    allocation.remaining_bad_debt,
+                )
+                for allocation in result.allocations
+            ),
+        )
+        self._events.append(event)
 
 
 def process_settlement(

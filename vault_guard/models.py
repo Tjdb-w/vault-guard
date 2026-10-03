@@ -16,6 +16,9 @@ __all__ = [
     "BatchSettlementResult",
     "RiskGroupUsage",
     "RiskGroupBatchResult",
+    "RecoveryAllocation",
+    "RecoveryResult",
+    "OutstandingBadDebt",
     "AuditEvent",
 ]
 
@@ -157,6 +160,55 @@ class RiskGroupBatchResult:
 
 
 @dataclass(frozen=True)
+class RecoveryAllocation:
+    """一笔回收对单笔存续坏账的冲减明细（按冲减顺序排列）。
+
+    - ``source_transaction_id``：产生该坏账的来源结算流水号。
+    - ``creditor``：被冲减的债权名。
+    - ``recovered_amount``：本次回收对该笔坏账的冲减额。
+    - ``remaining_bad_debt``：冲减后该笔坏账的剩余余额。
+    """
+
+    source_transaction_id: str
+    creditor: str
+    recovered_amount: Decimal
+    remaining_bad_debt: Decimal
+
+
+@dataclass(frozen=True)
+class RecoveryResult:
+    """存续坏账回收的公开返回结构（不可变）。
+
+    - ``recovery_amount``：归一化后的回收额。
+    - ``allocations``：按冲减顺序排列的 :class:`RecoveryAllocation`。
+    - ``total_recovered``：本次回收合计（等于 ``recovery_amount``）。
+    - ``outstanding_bad_debt``：回收后该币种的存续坏账总额。
+    """
+
+    recovery_transaction_id: str
+    currency: str
+    recovery_amount: Decimal
+    allocations: tuple[RecoveryAllocation, ...]
+    total_recovered: Decimal
+    outstanding_bad_debt: Decimal
+    event_id: str
+
+
+@dataclass(frozen=True)
+class OutstandingBadDebt:
+    """查询时点的一笔存续坏账余额。
+
+    - ``source_transaction_id``：产生该坏账的来源结算流水号。
+    - ``balance``：该笔坏账的剩余余额。
+    """
+
+    source_transaction_id: str
+    creditor: str
+    currency: str
+    balance: Decimal
+
+
+@dataclass(frozen=True)
 class AuditEvent:
     """内存追加式审计台账中的一条事件。
 
@@ -176,3 +228,6 @@ class AuditEvent:
     uncovered_bad_debt: Decimal
     validated_available_balance: Decimal
     rejection_reason: str | None
+    # 回收事件的冲减明细：
+    # (来源结算流水号, 债权名, 本次冲减额, 剩余坏账)；结算事件恒为空元组。
+    recovery_allocations: tuple[tuple[str, str, Decimal, Decimal], ...] = ()
