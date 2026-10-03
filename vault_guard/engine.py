@@ -18,6 +18,15 @@
 流水号、不改余额并回退批内状态；校验通过后逐笔限额校验与清算，通过请求
 各追加一条现有结构事件，批次本身不建事件。
 
+风险组批次（:meth:`ClearingEngine.process_risk_group_batch`，模块级
+:func:`process_settlement_risk_group_batch` 使用一次性引擎，不跨批次保留
+风险组状态）在以上规则之上增加风险组累计限额：请求可携带 ``risk_group_id``，
+限额表把该标识映射到非负上限；同一风险组跨请求、跨批次按请求顺序累计已
+放行请求的风险占用，加入本笔后超过组上限则该笔以
+``GROUP_LIMIT_EXCEEDED`` 拒绝（不分配资金、不改资金池、不确认坏账、不增加
+已用额度），生成现有结构审计事件并继续处理后续请求。不带风险组的请求仍
+只按单笔基础限额处理。
+
 校验异常不产生任何分配，也不写入台账；重复流水号在任何状态变更之前抛出。
 """
 
@@ -25,6 +34,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
 from decimal import Decimal, InvalidOperation
 from math import isfinite
+from types import MappingProxyType
 from typing import Union
 
 from .errors import (
@@ -33,6 +43,7 @@ from .errors import (
     EmptyCreditorListError,
     InvalidCurrencyError,
     InvalidRiskFactorError,
+    InvalidRiskGroupError,
     MixedCurrencyError,
 )
 from .models import (
@@ -40,11 +51,18 @@ from .models import (
     BatchSettlementResult,
     Creditor,
     CreditorAttribution,
+    RiskGroupBatchResult,
+    RiskGroupUsage,
     SettlementRequest,
     SettlementResult,
 )
 
-__all__ = ["ClearingEngine", "process_settlement", "process_settlement_batch"]
+__all__ = [
+    "ClearingEngine",
+    "process_settlement",
+    "process_settlement_batch",
+    "process_settlement_risk_group_batch",
+]
 
 Number = Union[int, float, Decimal]
 
@@ -91,6 +109,9 @@ class ClearingEngine:
         self._events: list[AuditEvent] = []
         self._results: dict[str, SettlementResult] = {}
         self._sequence = 0
+        # 风险组登记上限与累计已用额度，跨批次保留。
+        self._risk_group_limits: dict[str, Decimal] = {}
+        self._risk_group_used: dict[str, Decimal] = {}
 
     # ------------------------------------------------------------------ #
     # 只读查询（不触发清算，不改变任何状态）
@@ -217,6 +238,86 @@ class ClearingEngine:
             validated_available_balance=balance,
         )
 
+    def process_risk_group_batch(
+        self,
+        currency: str,
+        opening_pool_balance: Number,
+        risk_group_limits: Mapping[str, Number],
+        requests: Iterable[Mapping[str, object]],
+    ) -> RiskGroupBatchResult:
+        """处理带风险组累计限额的同币种多笔结算批次。
+
+        - ``currency`` / ``opening_pool_balance`` / ``requests``：语义同
+          :meth:`process_batch`；``requests`` 每项在既有字段外可携带
+          ``risk_group_id``（缺省或 ``None`` 表示不参与风险组控制，仍只按
+          单笔基础限额处理）。
+        - ``risk_group_limits``：风险组标识到非负上限的映射。标识为空、
+          限额非法（非数值 / NaN / 无穷 / 负数）、请求引用未登记组，或同一
+          引擎对同一组给出与已登记不同的上限，均抛出
+          :class:`InvalidRiskGroupError`；其余输入异常沿用既有类型。
+
+        风险占用仍按 ``拟清算金额 + 名义敞口 × 风险系数`` 计算，按请求顺序
+        在组内累计；加入本笔后超过组上限的笔以 ``GROUP_LIMIT_EXCEEDED``
+        拒绝：不分配资金、不改资金池、不确认坏账、不增加已用额度，但生成
+        现有结构审计事件并继续处理后续请求。组额度只在成功放行的请求上
+        增加；余额不足、单笔基础限额或组限额拒绝均不占用。同一引擎后续
+        批次继续累计，不同风险组互不影响。
+
+        校验失败不生成事件、不占流水号、不改余额与风险组额度，并回退批内
+        已产生的全部状态。
+        """
+        currency, opening, normalized, new_limits = (
+            self._validate_risk_group_batch(
+                currency, opening_pool_balance, risk_group_limits, requests
+            )
+        )
+
+        # 执行阶段基于已校验数据不会失败；仍防御性回滚，保证异常路径下
+        # 事件、序号、流水号、结果索引与风险组状态全部复原。
+        events_mark = len(self._events)
+        sequence_mark = self._sequence
+        limits_mark = dict(self._risk_group_limits)
+        used_mark = dict(self._risk_group_used)
+        added_ids: list[str] = []
+        results: list[SettlementResult] = []
+        balance = opening
+        try:
+            for group_id, limit in new_limits.items():
+                self._risk_group_limits[group_id] = limit
+                self._risk_group_used.setdefault(group_id, _ZERO)
+            for request in normalized:
+                request = replace(request, pool_balance=balance)
+                self._seen_transactions.add(request.transaction_id)
+                added_ids.append(request.transaction_id)
+                result = self._execute(request)
+                results.append(result)
+                balance = result.validated_available_balance
+        except Exception:
+            del self._events[events_mark:]
+            self._sequence = sequence_mark
+            self._risk_group_limits = limits_mark
+            self._risk_group_used = used_mark
+            for tid in added_ids:
+                self._seen_transactions.discard(tid)
+                self._results.pop(tid, None)
+            raise
+
+        return RiskGroupBatchResult(
+            results=tuple(results),
+            event_ids=tuple(result.event_id for result in results),
+            validated_available_balance=balance,
+            risk_groups=MappingProxyType(
+                {
+                    group_id: RiskGroupUsage(
+                        used=self._risk_group_used[group_id],
+                        limit=limit,
+                        remaining=limit - self._risk_group_used[group_id],
+                    )
+                    for group_id, limit in self._risk_group_limits.items()
+                }
+            ),
+        )
+
     def _execute(self, request: SettlementRequest) -> SettlementResult:
         """对已校验请求执行限额校验、清算与审计追加。"""
         # 限额校验。拒绝时余额不变、无任何分配。
@@ -224,6 +325,7 @@ class ClearingEngine:
             request.settlement_amount
             + request.notional_exposure * request.risk_factor
         )
+        group_id = request.risk_group_id
         if request.settlement_amount > request.pool_balance:
             result = self._build_rejected(
                 request, risk_occupancy, "SETTLEMENT_EXCEEDS_AVAILABLE_BALANCE"
@@ -232,8 +334,25 @@ class ClearingEngine:
             result = self._build_rejected(
                 request, risk_occupancy, "RISK_OCCUPANCY_EXCEEDS_BASE_LIMIT"
             )
+        elif (
+            group_id is not None
+            and self._risk_group_used[group_id] + risk_occupancy
+            > self._risk_group_limits[group_id]
+        ):
+            result = self._build_rejected(
+                request, risk_occupancy, "GROUP_LIMIT_EXCEEDED"
+            )
         else:
             result = self._settle(request, risk_occupancy)
+            if group_id is not None:
+                # 组额度只在成功放行的请求上按其风险占用增加。
+                self._risk_group_used[group_id] += risk_occupancy
+
+        if group_id is not None:
+            # 拒绝结果未占用额度：等于执行前值。
+            result = replace(
+                result, group_used_after=self._risk_group_used[group_id]
+            )
 
         self._append_audit(request, result)
         return result
@@ -408,15 +527,98 @@ class ClearingEngine:
 
         return currency, opening, normalized
 
+    # ------------------------------------------------------------------ #
+    # 风险组批次校验（整体校验通过后才开始任何状态变更）
+    # ------------------------------------------------------------------ #
+
+    def _validate_risk_group_batch(
+        self,
+        currency: str,
+        opening_pool_balance: Number,
+        risk_group_limits: Mapping[str, Number],
+        requests: Iterable[Mapping[str, object]],
+    ) -> tuple[str, Decimal, list[SettlementRequest], dict[str, Decimal]]:
+        if requests is None:
+            raise EmptyBatchError("批次请求清单为空")
+        try:
+            items = list(requests)
+        except TypeError:
+            raise EmptyBatchError("批次请求清单为空") from None
+        if not items:
+            raise EmptyBatchError("批次请求清单为空")
+
+        if not isinstance(currency, str) or not currency.strip():
+            raise InvalidCurrencyError("账户币种缺失或为空")
+        currency = currency.strip()
+
+        opening = _as_decimal(opening_pool_balance, "opening_pool_balance")
+        _check_non_negative(opening, "opening_pool_balance")
+
+        new_limits = self._normalize_risk_group_limits(risk_group_limits)
+        registered = set(self._risk_group_limits) | set(new_limits)
+
+        # 逐请求归一化（不含流水号去重）：数值 / 系数 / 债权币种 / 风险组
+        # 标识错误在此抛出。
+        normalized = [
+            self._normalize_batch_item(
+                item, index, currency, opening, registered_groups=registered
+            )
+            for index, item in enumerate(items)
+        ]
+
+        # 重复流水号最后统一判定：批内互相重复或与台账重复均拒绝。
+        seen_in_batch: set[str] = set()
+        for request in normalized:
+            tid = request.transaction_id
+            if tid in seen_in_batch or tid in self._seen_transactions:
+                raise DuplicateTransactionError(
+                    f"重复的业务流水号: {tid}"
+                )
+            seen_in_batch.add(tid)
+
+        return currency, opening, normalized, new_limits
+
+    def _normalize_risk_group_limits(
+        self, risk_group_limits: Mapping[str, Number]
+    ) -> dict[str, Decimal]:
+        """归一化风险组限额表；所有风险组字段错误只抛
+        :class:`InvalidRiskGroupError`。同一引擎内同一组上限必须一致。"""
+        if not isinstance(risk_group_limits, Mapping):
+            raise InvalidRiskGroupError("风险组限额表必须是标识到上限的映射")
+
+        new_limits: dict[str, Decimal] = {}
+        for raw_id, raw_limit in risk_group_limits.items():
+            if not isinstance(raw_id, str) or not raw_id.strip():
+                raise InvalidRiskGroupError("风险组标识必须是非空字符串")
+            group_id = raw_id.strip()
+            try:
+                limit = _as_decimal(raw_limit, f"risk_group_limits[{group_id}]")
+            except ValueError as exc:
+                raise InvalidRiskGroupError(str(exc)) from None
+            if limit < _ZERO:
+                raise InvalidRiskGroupError(
+                    f"风险组 {group_id} 限额不得为负数，收到 {limit}"
+                )
+            existing = self._risk_group_limits.get(group_id)
+            if existing is not None and existing != limit:
+                raise InvalidRiskGroupError(
+                    f"风险组 {group_id} 已登记上限 {existing}，"
+                    f"与本次给出的 {limit} 不一致"
+                )
+            new_limits[group_id] = limit
+        return new_limits
+
     def _normalize_batch_item(
         self,
         item: object,
         index: int,
         currency: str,
         opening_pool_balance: Decimal,
+        registered_groups: set[str] | None = None,
     ) -> SettlementRequest:
         """归一化批次中的单个请求映射；``pool_balance`` 暂存期初余额，
-        执行时替换为滚动余额。"""
+        执行时替换为滚动余额。``registered_groups`` 为 ``None`` 时忽略
+        风险组字段（普通批次），否则校验 ``risk_group_id``。"""
         if not isinstance(item, Mapping):
             raise ValueError(
                 f"requests[{index}] 必须是字段映射，收到 "
@@ -426,6 +628,21 @@ class ClearingEngine:
         transaction_id = item.get("transaction_id")
         if not isinstance(transaction_id, str) or not transaction_id.strip():
             raise ValueError("transaction_id 必须是非空字符串")
+
+        risk_group_id = None
+        if registered_groups is not None:
+            raw_group_id = item.get("risk_group_id")
+            if raw_group_id is not None:
+                if not isinstance(raw_group_id, str) or not raw_group_id.strip():
+                    raise InvalidRiskGroupError(
+                        f"requests[{index}] 的风险组标识必须是非空字符串"
+                    )
+                risk_group_id = raw_group_id.strip()
+                if risk_group_id not in registered_groups:
+                    raise InvalidRiskGroupError(
+                        f"requests[{index}] 引用了未登记的风险组: "
+                        f"{risk_group_id}"
+                    )
 
         amount = _as_decimal(
             item.get("settlement_amount"), f"requests[{index}].settlement_amount"
@@ -469,6 +686,7 @@ class ClearingEngine:
             risk_factor=factor,
             creditors=tuple(creditor_list),
             supplementary_capital=capital,
+            risk_group_id=risk_group_id,
         )
 
     # ------------------------------------------------------------------ #
@@ -657,5 +875,25 @@ def process_settlement_batch(
     return ClearingEngine().process_batch(
         currency=currency,
         opening_pool_balance=opening_pool_balance,
+        requests=requests,
+    )
+
+
+def process_settlement_risk_group_batch(
+    currency: str,
+    opening_pool_balance: Number,
+    risk_group_limits: Mapping[str, Number],
+    requests: Iterable[Mapping[str, object]],
+) -> RiskGroupBatchResult:
+    """模块级便捷入口：用一次性引擎实例处理带风险组限额的批次并返回结果。
+
+    不保留跨批次的台账、流水号去重与风险组状态；需要跨批次累计风险组
+    额度时，请直接使用 :class:`ClearingEngine` 的
+    :meth:`~ClearingEngine.process_risk_group_batch`。
+    """
+    return ClearingEngine().process_risk_group_batch(
+        currency=currency,
+        opening_pool_balance=opening_pool_balance,
+        risk_group_limits=risk_group_limits,
         requests=requests,
     )
