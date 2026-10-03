@@ -9,6 +9,7 @@
 - 风险系数越界 -> :class:`InvalidRiskFactorError`
 - 混合币种 -> :class:`MixedCurrencyError`
 - 空批次 -> :class:`EmptyBatchError`
+- 风险组标识 / 限额错误 -> :class:`InvalidRiskGroupError`
 """
 
 __all__ = [
@@ -19,6 +20,7 @@ __all__ = [
     "InvalidRiskFactorError",
     "MixedCurrencyError",
     "EmptyBatchError",
+    "InvalidRiskGroupError",
 ]
 
 
@@ -48,3 +50,7 @@ class MixedCurrencyError(VaultGuardError):
 
 class EmptyBatchError(VaultGuardError):
     """批次请求清单为空。"""
+
+
+class InvalidRiskGroupError(VaultGuardError):
+    """风险组标识为空、引用未登记组、限额非法或与已登记限额不一致。"""

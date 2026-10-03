@@ -93,6 +93,53 @@ batch = engine.process_batch(
 模块级 `vault_guard.process_settlement_batch(currency,
 opening_pool_balance, requests)` 使用一次性引擎返回结果，不跨批次去重。
 
+## 风险组累计限额批次
+
+`ClearingEngine.process_risk_group_batch(currency, opening_pool_balance,
+risk_group_limits, requests)` 在批次规则之上增加风险组累计限额，把同一
+风险组跨请求、跨批次的新增风险占用纳入控制：
+
+```python
+batch = engine.process_risk_group_batch(
+    currency="USD",
+    opening_pool_balance=Decimal("1000"),
+    risk_group_limits={"RG-A": Decimal("100")},  # 风险组标识 -> 非负上限
+    requests=[
+        {   # 字段沿用 process_batch，另需 risk_group_id
+            "transaction_id": "TX-201",
+            "settlement_amount": Decimal("60"),
+            "notional_exposure": Decimal("0"),
+            "base_limit": Decimal("1000"),
+            "risk_factor": Decimal("0"),
+            "creditors": [("senior", Decimal("60"))],
+            "risk_group_id": "RG-A",
+        },
+        # ... 后续请求
+    ],
+)
+```
+
+- 风险占用仍按 `拟清算金额 + 名义敞口 × 风险系数` 计算，按请求顺序累计；
+  加入本笔后超过组上限的请求以 `approved=False`、
+  `rejection_reason="GROUP_LIMIT_EXCEEDED"` 拒绝：不分配资金、不改资金池、
+  不确认坏账、不增加已用额度，但仍生成一条现有结构审计事件并继续处理
+  后续请求。
+- 组已用额度只在成功放行的请求上增加；余额不足或超基础限额的拒绝同样
+  不占用额度。同一引擎的后续批次继续累计，不同风险组互不影响。
+- 风险组字段错误（标识为空、引用未登记组、限额非法、同一引擎给出不同
+  上限）只抛出 `vault_guard.InvalidRiskGroupError`；其余批次输入异常沿用
+  现有异常类型。异常时不产生事件、不占流水号、不改资金池与风险组额度。
+
+返回不可变的 `RiskGroupBatchResult`：`results` / `event_ids` /
+`validated_available_balance` 语义同 `BatchSettlementResult`，另含
+`group_usage`（风险组标识 → `RiskGroupUsage(used, limit, remaining)` 的
+只读映射，覆盖引擎已登记的全部风险组）；每笔 `results` 另带
+`group_used_after`，表示该笔执行后的组内已用额度（未占用额度的拒绝结果
+等于执行前值）。
+
+模块级 `vault_guard.process_settlement_risk_group_batch(...)` 使用一次性
+引擎，不跨批次保留风险组状态。
+
 ## 处理规则（确定顺序）
 
 1. **输入校验**：负数金额/余额、重复流水号、缺币种、空债权清单、系数越界
@@ -127,6 +174,7 @@ opening_pool_balance, requests)` 使用一次性引擎返回结果，不跨批�
 | `risk_occupancy` | 风险占用 |
 | `event_id` | 本请求唯一审计事件标识 |
 | `rejection_reason` | 拒绝原因码，放行时为 `None` |
+| `group_used_after` | 仅风险组批次填充：该笔执行后的组内已用额度，其余路径为 `None` |
 
 ## 异常类型
 
@@ -139,6 +187,7 @@ opening_pool_balance, requests)` 使用一次性引擎返回结果，不跨批�
 | 风险系数越界（< 0 或 > 1） | `vault_guard.InvalidRiskFactorError` |
 | 单笔请求内混合币种 | `vault_guard.MixedCurrencyError` |
 | 空批次请求清单 | `vault_guard.EmptyBatchError` |
+| 风险组标识为空 / 引用未登记组 / 限额非法 / 限额与已登记值冲突 | `vault_guard.InvalidRiskGroupError` |
 
 校验异常不产生任何半成品分配，也不写入审计台账；失败请求的流水号不被占用，
 可在修正后用同一流水号重新提交。

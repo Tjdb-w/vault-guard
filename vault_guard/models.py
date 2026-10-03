@@ -14,6 +14,8 @@ __all__ = [
     "CreditorAttribution",
     "SettlementResult",
     "BatchSettlementResult",
+    "RiskGroupUsage",
+    "RiskGroupBatchResult",
     "AuditEvent",
 ]
 
@@ -94,6 +96,9 @@ class SettlementResult:
     risk_occupancy: Decimal
     event_id: str
     rejection_reason: str | None
+    # 仅风险组批次入口填充：该笔执行后其风险组的累计已用额度；
+    # 未占用的拒绝结果等于执行前值，非风险组路径为 None。
+    group_used_after: Decimal | None = None
 
     @property
     def total_pool_allocated(self) -> Decimal:
@@ -117,6 +122,38 @@ class BatchSettlementResult:
     results: tuple[SettlementResult, ...]
     event_ids: tuple[str, ...]
     validated_available_balance: Decimal
+
+
+@dataclass(frozen=True)
+class RiskGroupUsage:
+    """单个风险组的累计额度快照（不可变）。
+
+    - ``used``：已成功放行请求的累计风险占用。
+    - ``limit``：该组登记的非负上限。
+    - ``remaining``：剩余可用额度，恒等于 ``limit - used``。
+    """
+
+    used: Decimal
+    limit: Decimal
+    remaining: Decimal
+
+
+@dataclass(frozen=True)
+class RiskGroupBatchResult:
+    """风险组批次结算的公开返回结构（不可变）。
+
+    - ``results`` / ``event_ids`` / ``validated_available_balance``：语义与
+      :class:`BatchSettlementResult` 相同；每笔 ``results`` 另带
+      ``group_used_after``。
+    - ``group_usage``：风险组标识 -> :class:`RiskGroupUsage` 的只读映射，
+      覆盖引擎已登记的全部风险组（含本批次新登记），反映批次执行后的
+      累计状态。
+    """
+
+    results: tuple[SettlementResult, ...]
+    event_ids: tuple[str, ...]
+    validated_available_balance: Decimal
+    group_usage: Mapping[str, RiskGroupUsage]
 
 
 @dataclass(frozen=True)
