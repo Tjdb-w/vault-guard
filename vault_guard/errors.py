@@ -10,6 +10,8 @@
 - 混合币种 -> :class:`MixedCurrencyError`
 - 空批次 -> :class:`EmptyBatchError`
 - 风险组标识 / 限额错误 -> :class:`InvalidRiskGroupError`
+- 回收时该币种无存续坏账 -> :class:`NoOutstandingBadDebtError`
+- 回收额超过该币种存续坏账 -> :class:`RecoveryAmountExceedsOutstandingError`
 """
 
 __all__ = [
@@ -21,6 +23,8 @@ __all__ = [
     "MixedCurrencyError",
     "EmptyBatchError",
     "InvalidRiskGroupError",
+    "NoOutstandingBadDebtError",
+    "RecoveryAmountExceedsOutstandingError",
 ]
 
 
@@ -54,3 +58,11 @@ class EmptyBatchError(VaultGuardError):
 
 class InvalidRiskGroupError(VaultGuardError):
     """风险组标识为空、引用未登记组、限额非法或同一引擎内上限不一致。"""
+
+
+class NoOutstandingBadDebtError(VaultGuardError):
+    """回收提交时，该币种当前没有任何存续坏账。"""
+
+
+class RecoveryAmountExceedsOutstandingError(VaultGuardError):
+    """回收金额超过该币种当前存续坏账总额。"""

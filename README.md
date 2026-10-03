@@ -139,18 +139,67 @@ opening_pool_balance, requests)` 使用一次性引擎返回结果，不跨批�
 | 风险系数越界（< 0 或 > 1） | `vault_guard.InvalidRiskFactorError` |
 | 单笔请求内混合币种 | `vault_guard.MixedCurrencyError` |
 | 空批次请求清单 | `vault_guard.EmptyBatchError` |
+| 回收时该币种无存续坏账（含零额） | `vault_guard.NoOutstandingBadDebtError` |
+| 回收额超过该币种存续坏账 | `vault_guard.RecoveryAmountExceedsOutstandingError` |
 
 校验异常不产生任何半成品分配，也不写入审计台账；失败请求的流水号不被占用，
 可在修正后用同一流水号重新提交。
 
+## 存续坏账回收
+
+已放行结算留下的未覆盖债权构成**存续坏账**，可通过
+`ClearingEngine.process_recovery(recovery_transaction_id, currency,
+recovery_amount)` 提交回收；金额沿用既有数值归一化（`int` / `float` /
+`Decimal`，`float` 按字符串精确转换，负数 / NaN / 无穷 / 非数值抛
+`ValueError`）。回收不回写历史 `SettlementResult`，只更新存续坏账台账并
+追加一条审计事件。
+
+- **冲减顺序**：先按审计事件顺序（结算发生先后），再按各笔 `creditors`
+  顺序，只冲减币种相符且仍有坏账的债权；前项清零后才处理后项，一笔回收
+  可只部分覆盖单项债权。
+- **零额回收**：该币种仍有存续坏账时，零额回收合法，生成一条无冲减明细
+  的回收事件；无存续坏账时零额同样抛 `NoOutstandingBadDebtError`。
+- **事件标识**：`EVT-{recovery_transaction_id}-recovery`，序号在既有台账
+  上继续单调递增。
+- **流水号空间**：回收流水号与结算流水号共用同一去重空间，重复提交抛
+  `DuplicateTransactionError`；任何失败都不生成事件、不占流水号、不改状态。
+
+返回不可变的 `RecoveryResult`：
+
+| 字段 | 含义 |
+| --- | --- |
+| `recovery_transaction_id` | 回收流水号 |
+| `currency` | 回收币种 |
+| `recovery_amount` | 提交的回收金额 |
+| `allocations` | 按实际冲减顺序排列的 `RecoveryAllocation`（来源结算流水号、债权名、本次冲减、剩余坏账） |
+| `total_recovered` | 本次回收合计（各明细冲减之和） |
+| `outstanding_bad_debt` | 冲减后该币种存续坏账总额 |
+| `event_id` | 回收审计事件标识 |
+
+只读查询不触发清算、不影响其他币种：
+
+- `engine.recovery_of(recovery_transaction_id)`：返回 `RecoveryResult` 或
+  `None`；
+- `engine.outstanding_bad_debts(currency)`：返回该币种仍有余额的坏账明细
+  元组，逐项 `OutstandingBadDebt`（来源流水号、债权名、币种、余额），顺序
+  与冲减顺序一致；已清零的债权不再出现。
+
+回收事件在 `AuditEvent.recovery_allocations` 中保存与返回结果同额的
+`(来源流水号, 债权名, 本次冲减, 剩余坏账)` 明细；既有结算事件该字段恒为
+空元组，其余字段值保持不变。
+
 ## 审计台账
 
 - 每个被引擎接受处理的请求（放行或拒绝）**恰好**生成一个事件标识，台账为
-  实例内内存中的追加式序列，序号单调递增。
-- 事件包含流水号、输入摘要、校验结果、风险占用、各层分配与最终未覆盖金额。
+  实例内内存中的追加式序列，序号单调递增；每笔成功提交的回收（含有坏账时
+  的零额回收）同样追加一个事件，序号继续递增。
+- 事件包含流水号、输入摘要、校验结果、风险占用、各层分配与最终未覆盖金额；
+  回收事件的冲减明细保存在 `recovery_allocations`。
 - 只读查询不触发清算：`engine.audit_log`（快照）、`engine.events()`、
   `engine.get_event(transaction_id)`、`engine.result_of(transaction_id)`、
-  `engine.has_transaction(transaction_id)`。
+  `engine.has_transaction(transaction_id)`、
+  `engine.recovery_of(recovery_transaction_id)`、
+  `engine.outstanding_bad_debts(currency)`。
 
 ## 测试
 

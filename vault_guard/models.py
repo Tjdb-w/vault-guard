@@ -16,6 +16,9 @@ __all__ = [
     "BatchSettlementResult",
     "RiskGroupUsage",
     "RiskGroupBatchResult",
+    "RecoveryAllocation",
+    "OutstandingBadDebt",
+    "RecoveryResult",
     "AuditEvent",
 ]
 
@@ -157,10 +160,69 @@ class RiskGroupBatchResult:
 
 
 @dataclass(frozen=True)
+class RecoveryAllocation:
+    """一笔回收对单项存续坏账的冲减明细。
+
+    - ``source_transaction_id``：坏账来源的已放行结算流水号。
+    - ``creditor``：债权名。
+    - ``amount``：本次冲减金额。
+    - ``remaining_bad_debt``：冲减后该债权的剩余坏账。
+    """
+
+    source_transaction_id: str
+    creditor: str
+    amount: Decimal
+    remaining_bad_debt: Decimal
+
+
+@dataclass(frozen=True)
+class OutstandingBadDebt:
+    """单项存续坏账的只读明细。
+
+    - ``source_transaction_id``：坏账来源的已放行结算流水号。
+    - ``creditor``：债权名。
+    - ``currency``：坏账币种。
+    - ``balance``：当前剩余坏账余额。
+    """
+
+    source_transaction_id: str
+    creditor: str
+    currency: str
+    balance: Decimal
+
+
+@dataclass(frozen=True)
+class RecoveryResult:
+    """存续坏账回收的公开返回结构（不可变）。
+
+    - ``recovery_transaction_id``：回收流水号。
+    - ``currency``：回收币种。
+    - ``recovery_amount``：提交的回收金额。
+    - ``allocations``：按实际冲减顺序排列的
+      :class:`RecoveryAllocation`（先按审计事件顺序、再按债权顺序）。
+    - ``total_recovered``：本次回收合计（等于各明细冲减之和）。
+    - ``outstanding_bad_debt``：冲减后该币种的存续坏账总额。
+    - ``event_id``：本笔回收的审计事件标识。
+    """
+
+    recovery_transaction_id: str
+    currency: str
+    recovery_amount: Decimal
+    allocations: tuple[RecoveryAllocation, ...]
+    total_recovered: Decimal
+    outstanding_bad_debt: Decimal
+    event_id: str
+
+
+@dataclass(frozen=True)
 class AuditEvent:
     """内存追加式审计台账中的一条事件。
 
-    每个请求（放行或拒绝）恰好产生一条事件；输入校验异常不产生事件。
+    每个被引擎接受处理的请求恰好产生一条事件（结算请求放行或拒绝各一条，
+    输入校验异常不产生事件）；存续坏账回收（含有坏账时的零额回收）同样
+    追加一条事件。``recovery_allocations`` 仅在回收事件上承载与
+    :class:`RecoveryResult` 同额的冲减明细，结算事件恒为空元组，既有结算
+    事件的其余字段值保持不变。
     """
 
     event_id: str
@@ -176,3 +238,6 @@ class AuditEvent:
     uncovered_bad_debt: Decimal
     validated_available_balance: Decimal
     rejection_reason: str | None
+    recovery_allocations: tuple[
+        tuple[str, str, Decimal, Decimal], ...
+    ] = ()
