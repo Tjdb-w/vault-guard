@@ -18,6 +18,14 @@
 流水号、不改余额并回退批内状态；校验通过后逐笔限额校验与清算，通过请求
 各追加一条现有结构事件，批次本身不建事件。
 
+多币种批次（:meth:`ClearingEngine.process_multicurrency_batch`，模块级
+:func:`process_settlement_multicurrency_batch` 使用一次性引擎，不跨批次
+保留状态）以期初余额映射替代单一币种：每个请求自带 ``currency``，各币种
+独立记账、各自滚动余额，不换汇、不使用汇率；请求币种必须在期初映射中
+登记，未登记或空白抛 :class:`InvalidCurrencyError`；单笔内债权混合币种
+仍抛 :class:`MixedCurrencyError`。其余限额、瀑布、补充资本、坏账归因、
+拒绝原因码与审计事件规则与同币种批次一致。
+
 风险组批次（:meth:`ClearingEngine.process_risk_group_batch`，模块级
 :func:`process_settlement_risk_group_batch` 使用一次性引擎，不跨批次保留
 风险组状态）在以上规则之上增加风险组累计限额：请求可携带 ``risk_group_id``，
@@ -61,6 +69,7 @@ from .models import (
     BatchSettlementResult,
     Creditor,
     CreditorAttribution,
+    MulticurrencyBatchResult,
     OutstandingBadDebt,
     RecoveryAllocation,
     RecoveryResult,
@@ -74,6 +83,7 @@ __all__ = [
     "ClearingEngine",
     "process_settlement",
     "process_settlement_batch",
+    "process_settlement_multicurrency_batch",
     "process_settlement_risk_group_batch",
 ]
 
@@ -292,6 +302,77 @@ class ClearingEngine:
             results=tuple(results),
             event_ids=tuple(result.event_id for result in results),
             validated_available_balance=balance,
+        )
+
+    def process_multicurrency_batch(
+        self,
+        opening_pool_balances: Mapping[str, Number],
+        requests: Iterable[Mapping[str, object]],
+    ) -> MulticurrencyBatchResult:
+        """处理多币种批次结算，返回不可变 :class:`MulticurrencyBatchResult`。
+
+        - ``opening_pool_balances``：币种到非负期初资金池余额的映射；批次内
+          出现的每个请求币种都必须在此登记。
+        - ``requests``：请求映射序列，每项字段沿用 :meth:`process_batch`
+          单项字段（``transaction_id`` / ``settlement_amount`` /
+          ``notional_exposure`` / ``base_limit`` / ``risk_factor`` /
+          ``creditors``，以及可选的 ``supplementary_capital``，默认 0），
+          并增加必填的 ``currency``；``pool_balance`` 不在单项内指定，取
+          该币种的滚动余额。
+
+        各币种独立记账：每笔只动用自身币种的余额，放行扣减本币种余额，拒绝
+        不动余额；不做换汇，不使用汇率。未被任何请求引用的币种在结果中保留
+        期初原值。
+
+        批次先做整体校验，失败不生成事件、不占流水号、不改余额与坏账台账。
+        错误依次为：空批次 :class:`EmptyBatchError`；期初映射非法、空白余额
+        键或任何数值非法 :class:`ValueError`；请求币种缺失、空白或未在期初
+        映射中登记 :class:`InvalidCurrencyError`；单笔债权混合币种
+        :class:`MixedCurrencyError`；重复流水号
+        :class:`DuplicateTransactionError`；空债权清单
+        :class:`EmptyCreditorListError`；风险系数越界
+        :class:`InvalidRiskFactorError`。
+
+        校验通过后按请求顺序逐笔执行既有单笔规则（限额、瀑布、补充资本、
+        坏账归因与两种拒绝原因码）；放行与拒绝各追加一条现有结构事件
+        （序号递增），拒绝后继续处理后续请求，批次本身不建事件。未覆盖坏账
+        按各自币种进入存续坏账台账，可由 :meth:`process_recovery` 冲减。
+        """
+        opening, normalized = self._validate_multicurrency_batch(
+            opening_pool_balances, requests
+        )
+
+        # 执行阶段基于已校验数据不会失败；仍防御性回滚，保证异常路径下
+        # 事件、序号、流水号、结果索引与坏账台账全部复原。
+        events_mark = len(self._events)
+        sequence_mark = self._sequence
+        ledger_mark = len(self._bad_debt_ledger)
+        added_ids: list[str] = []
+        results: list[SettlementResult] = []
+        balances = dict(opening)
+        try:
+            for request in normalized:
+                request = replace(
+                    request, pool_balance=balances[request.currency]
+                )
+                self._seen_transactions.add(request.transaction_id)
+                added_ids.append(request.transaction_id)
+                result = self._execute(request)
+                results.append(result)
+                balances[request.currency] = result.validated_available_balance
+        except Exception:
+            del self._events[events_mark:]
+            self._sequence = sequence_mark
+            del self._bad_debt_ledger[ledger_mark:]
+            for tid in added_ids:
+                self._seen_transactions.discard(tid)
+                self._results.pop(tid, None)
+            raise
+
+        return MulticurrencyBatchResult(
+            results=tuple(results),
+            event_ids=tuple(result.event_id for result in results),
+            validated_available_balances=MappingProxyType(balances),
         )
 
     def process_risk_group_batch(
@@ -678,6 +759,231 @@ class ClearingEngine:
             seen_in_batch.add(tid)
 
         return currency, opening, normalized
+
+    # ------------------------------------------------------------------ #
+    # 多币种批次校验（整体校验通过后才开始任何状态变更）
+    # ------------------------------------------------------------------ #
+
+    def _validate_multicurrency_batch(
+        self,
+        opening_pool_balances: Mapping[str, Number],
+        requests: Iterable[Mapping[str, object]],
+    ) -> tuple[dict[str, Decimal], list[SettlementRequest]]:
+        """按既定顺序分阶段校验多币种批次，返回期初余额表与归一化请求。
+
+        阶段顺序即公开文档的错误顺序：空批次 -> 期初映射 / 数值 ->
+        请求币种 -> 债权币种 -> 重复流水号 -> 空债权清单 -> 风险系数区间。
+        """
+        if requests is None:
+            raise EmptyBatchError("批次请求清单为空")
+        try:
+            items = list(requests)
+        except TypeError:
+            raise EmptyBatchError("批次请求清单为空") from None
+        if not items:
+            raise EmptyBatchError("批次请求清单为空")
+
+        opening = self._normalize_opening_balances(opening_pool_balances)
+
+        # 逐请求解析结构与数值（不含币种归属、去重、空清单与系数区间）。
+        parsed = [
+            self._parse_multicurrency_item(item, index)
+            for index, item in enumerate(items)
+        ]
+
+        # 请求币种：缺失、空白或未在期初映射中登记均拒绝。
+        for record in parsed:
+            currency = record["currency"]
+            if not isinstance(currency, str) or not currency.strip():
+                raise InvalidCurrencyError("账户币种缺失或为空")
+            currency = currency.strip()
+            if currency not in opening:
+                raise InvalidCurrencyError(
+                    f"请求币种 {currency} 未在期初余额映射中登记"
+                )
+            record["currency"] = currency
+
+        # 债权币种：显式给出的债权币种必须与本笔请求币种一致。
+        for record in parsed:
+            for cindex, creditor in enumerate(record["creditors"] or ()):
+                ccy = creditor.currency
+                if ccy is None:
+                    continue
+                if not isinstance(ccy, str) or not ccy.strip():
+                    raise InvalidCurrencyError(
+                        f"creditors[{cindex}] 币种为空"
+                    )
+                ccy = ccy.strip()
+                if ccy != record["currency"]:
+                    raise MixedCurrencyError(
+                        f"账户币种 {record['currency']} 与债权 "
+                        f"{creditor.name} 币种 {ccy} 不一致"
+                    )
+
+        # 重复流水号：批内互相重复或与台账重复均拒绝。
+        seen_in_batch: set[str] = set()
+        for record in parsed:
+            tid = record["transaction_id"]
+            if tid in seen_in_batch or tid in self._seen_transactions:
+                raise DuplicateTransactionError(
+                    f"重复的业务流水号: {tid}"
+                )
+            seen_in_batch.add(tid)
+
+        # 空债权清单。
+        for record in parsed:
+            if not record["creditors"]:
+                raise EmptyCreditorListError("优先债权清单为空")
+
+        # 风险系数区间。
+        for record in parsed:
+            factor = record["risk_factor"]
+            if factor < _ZERO or factor > _ONE:
+                raise InvalidRiskFactorError(
+                    f"风险系数必须落在 [0, 1]，收到 {factor}"
+                )
+
+        normalized = [
+            SettlementRequest(
+                transaction_id=record["transaction_id"],
+                currency=record["currency"],
+                # 暂存本币种期初余额，执行时替换为该币种滚动余额。
+                pool_balance=opening[record["currency"]],
+                settlement_amount=record["settlement_amount"],
+                notional_exposure=record["notional_exposure"],
+                base_limit=record["base_limit"],
+                risk_factor=record["risk_factor"],
+                creditors=tuple(record["creditors"]),
+                supplementary_capital=record["supplementary_capital"],
+            )
+            for record in parsed
+        ]
+        return opening, normalized
+
+    @staticmethod
+    def _normalize_opening_balances(
+        opening_pool_balances: Mapping[str, Number],
+    ) -> dict[str, Decimal]:
+        """归一化币种到期初余额的映射；映射、键或数值非法抛 :class:`ValueError`。"""
+        if not isinstance(opening_pool_balances, Mapping):
+            raise ValueError(
+                "opening_pool_balances 必须是币种到期初余额的映射，收到 "
+                f"{type(opening_pool_balances).__name__}"
+            )
+        opening: dict[str, Decimal] = {}
+        for raw_key, raw_value in opening_pool_balances.items():
+            if not isinstance(raw_key, str) or not raw_key.strip():
+                raise ValueError("期初余额映射的币种键必须是非空字符串")
+            key = raw_key.strip()
+            value = _as_decimal(raw_value, f"opening_pool_balances[{key}]")
+            _check_non_negative(value, f"opening_pool_balances[{key}]")
+            opening[key] = value
+        return opening
+
+    def _parse_multicurrency_item(
+        self, item: object, index: int
+    ) -> dict[str, object]:
+        """解析多币种批次中的单个请求映射：结构、流水号与全部数值在此
+        校验（抛 :class:`ValueError`）；币种归属、债权币种一致性、空债权
+        清单与风险系数区间由后续阶段统一判定。债权清单缺失或不可迭代时
+        暂存 ``None``，留待空清单阶段抛出。"""
+        if not isinstance(item, Mapping):
+            raise ValueError(
+                f"requests[{index}] 必须是字段映射，收到 "
+                f"{type(item).__name__}"
+            )
+
+        transaction_id = item.get("transaction_id")
+        if not isinstance(transaction_id, str) or not transaction_id.strip():
+            raise ValueError("transaction_id 必须是非空字符串")
+
+        amount = _as_decimal(
+            item.get("settlement_amount"), f"requests[{index}].settlement_amount"
+        )
+        exposure = _as_decimal(
+            item.get("notional_exposure"),
+            f"requests[{index}].notional_exposure",
+        )
+        limit = _as_decimal(
+            item.get("base_limit"), f"requests[{index}].base_limit"
+        )
+        factor = _as_decimal(
+            item.get("risk_factor"), f"requests[{index}].risk_factor"
+        )
+        capital = _as_decimal(
+            item.get("supplementary_capital", _ZERO),
+            f"requests[{index}].supplementary_capital",
+        )
+
+        _check_non_negative(amount, f"requests[{index}].settlement_amount")
+        _check_non_negative(exposure, f"requests[{index}].notional_exposure")
+        _check_non_negative(limit, f"requests[{index}].base_limit")
+        _check_non_negative(capital, f"requests[{index}].supplementary_capital")
+
+        return {
+            "transaction_id": transaction_id,
+            "currency": item.get("currency"),
+            "settlement_amount": amount,
+            "notional_exposure": exposure,
+            "base_limit": limit,
+            "risk_factor": factor,
+            "supplementary_capital": capital,
+            "creditors": self._parse_multicurrency_creditors(
+                item.get("creditors"), index
+            ),
+        }
+
+    @staticmethod
+    def _parse_multicurrency_creditors(
+        raw: Iterable[Mapping[str, object] | Creditor | tuple[str, Number]],
+        index: int,
+    ) -> list[Creditor] | None:
+        """解析债权清单的各项结构、名称与金额；币种一致性与空清单不在此
+        判定（币种原样保留，缺失或不可迭代返回 ``None``）。"""
+        if raw is None:
+            return None
+        try:
+            iterator = iter(raw)
+        except TypeError:
+            return None
+
+        creditors: list[Creditor] = []
+        for cindex, entry in enumerate(iterator):
+            if isinstance(entry, Creditor):
+                name, claim, ccy = entry.name, entry.amount, entry.currency
+            elif isinstance(entry, Mapping):
+                name = entry.get("name")
+                claim = entry.get("amount")
+                ccy = entry.get("currency")
+            elif isinstance(entry, tuple):
+                if len(entry) == 2:
+                    name, claim = entry
+                    ccy = None
+                elif len(entry) == 3:
+                    name, claim, ccy = entry
+                else:
+                    raise ValueError(
+                        f"第 {cindex} 项债权元组必须是 (name, amount) 或 "
+                        f"(name, amount, currency)"
+                    )
+            else:
+                raise ValueError(
+                    f"第 {cindex} 项债权格式不被支持: {type(entry).__name__}"
+                )
+
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError(f"第 {cindex} 项债权缺少有效名称")
+            claim_dec = _as_decimal(claim, f"creditors[{cindex}].amount")
+            _check_non_negative(claim_dec, f"creditors[{cindex}].amount")
+
+            creditors.append(
+                Creditor(
+                    name=name.strip(),
+                    amount=claim_dec,
+                    currency=ccy.strip() if isinstance(ccy, str) else ccy,
+                )
+            )
+        return creditors
 
     # ------------------------------------------------------------------ #
     # 风险组批次校验（整体校验通过后才开始任何状态变更）
@@ -1073,6 +1379,22 @@ def process_settlement_batch(
     return ClearingEngine().process_batch(
         currency=currency,
         opening_pool_balance=opening_pool_balance,
+        requests=requests,
+    )
+
+
+def process_settlement_multicurrency_batch(
+    opening_pool_balances: Mapping[str, Number],
+    requests: Iterable[Mapping[str, object]],
+) -> MulticurrencyBatchResult:
+    """模块级便捷入口：用一次性引擎实例处理多币种批次并返回结果。
+
+    不保留跨批次的台账与流水号去重状态；需要复用时请直接使用
+    :class:`ClearingEngine` 的
+    :meth:`~ClearingEngine.process_multicurrency_batch`。
+    """
+    return ClearingEngine().process_multicurrency_batch(
+        opening_pool_balances=opening_pool_balances,
         requests=requests,
     )
 

@@ -5,6 +5,9 @@
 - :class:`ClearingEngine` / :func:`process_settlement`：单笔清算入口；
 - :meth:`ClearingEngine.process_batch` / :func:`process_settlement_batch`：
   同一币种的多笔批次结算入口；
+- :meth:`ClearingEngine.process_multicurrency_batch` /
+  :func:`process_settlement_multicurrency_batch`：多币种批次结算入口
+  （按币种独立记账，不换汇、不使用汇率）；
 - :meth:`ClearingEngine.process_risk_group_batch` /
   :func:`process_settlement_risk_group_batch`：带风险组累计限额的批次入口；
 - :meth:`ClearingEngine.process_recovery`：存续坏账回收入口（回收依赖台账
@@ -18,6 +21,7 @@ from .engine import (
     ClearingEngine,
     process_settlement,
     process_settlement_batch,
+    process_settlement_multicurrency_batch,
     process_settlement_risk_group_batch,
 )
 from .errors import (
@@ -37,6 +41,7 @@ from .models import (
     BatchSettlementResult,
     Creditor,
     CreditorAttribution,
+    MulticurrencyBatchResult,
     OutstandingBadDebt,
     RecoveryAllocation,
     RecoveryResult,
@@ -50,10 +55,12 @@ __all__ = [
     "ClearingEngine",
     "process_settlement",
     "process_settlement_batch",
+    "process_settlement_multicurrency_batch",
     "process_settlement_risk_group_batch",
     "SettlementRequest",
     "SettlementResult",
     "BatchSettlementResult",
+    "MulticurrencyBatchResult",
     "RiskGroupUsage",
     "RiskGroupBatchResult",
     "RecoveryAllocation",
