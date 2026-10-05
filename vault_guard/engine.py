@@ -5,6 +5,14 @@
 :meth:`ClearingEngine.process_batch`（模块级 :func:`process_settlement_batch`
 同样使用一次性引擎，不跨批次去重）。
 
+提交前只读预演 :meth:`ClearingEngine.preview_batch` 与
+:meth:`process_batch` 同输入、同债权格式、同币种、同滚动余额与清算瀑布，
+只报告台账当前状态下的执行结果：返回 :class:`BatchPreviewResult`（按请求
+顺序的 :class:`SettlementPreview`，除无 ``event_id`` 外与
+:class:`SettlementResult` 同名字段同义，及最终余额），不生成审计事件、不
+占流水号、不写结果索引或坏账台账，不代替正式提交；校验顺序与异常类型沿用
+:meth:`process_batch`，预演只读、幂等。
+
 单笔处理严格按确定顺序执行：
 
 1. 输入校验（负数 / 币种 / 系数 / 债权清单 / 流水号去重）。
@@ -17,6 +25,11 @@
 校验（空批次 / 币种 / 债权币种 / 流水号去重），校验失败不生成事件、不占
 流水号、不改余额并回退批内状态；校验通过后逐笔限额校验与清算，通过请求
 各追加一条现有结构事件，批次本身不建事件。
+
+:meth:`ClearingEngine.preview_batch` 是 :meth:`process_batch` 的只读预演：
+复用同一批次校验与逐笔判定（含滚动余额与清算瀑布），业务拒绝不抛异常而
+是逐笔返回 ``approved=False`` 与拒绝原因；预演不登记流水号、不追加事件、
+不写结果索引与坏账台账，异常路径天然不留状态，重复调用幂等。
 
 风险组批次（:meth:`ClearingEngine.process_risk_group_batch`，模块级
 :func:`process_settlement_risk_group_batch` 使用一次性引擎，不跨批次保留
@@ -65,6 +78,7 @@ from .errors import (
 )
 from .models import (
     AuditEvent,
+    BatchPreviewResult,
     BatchSettlementResult,
     Creditor,
     CreditorAttribution,
@@ -75,6 +89,7 @@ from .models import (
     RecoveryResult,
     RiskGroupBatchResult,
     RiskGroupUsage,
+    SettlementPreview,
     SettlementRequest,
     SettlementResult,
 )
@@ -392,6 +407,56 @@ class ClearingEngine:
             validated_available_balance=balance,
         )
 
+    def preview_batch(
+        self,
+        currency: str,
+        opening_pool_balance: Number,
+        requests: Iterable[Mapping[str, object]],
+    ) -> BatchPreviewResult:
+        """对同一币种的多笔结算批次做提交前只读预演，返回不可变
+        :class:`BatchPreviewResult`。
+
+        输入、债权格式、币种、滚动余额与清算瀑布完全沿用
+        :meth:`process_batch`；区别仅在于预演只报告台账**当前**状态下的
+        执行结果：不生成审计事件、不占流水号、不写入结果索引或坏账台账，
+        也不代替 :meth:`process_batch` 提交。
+
+        - 校验顺序与异常类型与 :meth:`process_batch` 完全一致：空批次抛
+          :class:`EmptyBatchError`，缺币种抛 :class:`InvalidCurrencyError`，
+          债权币种混用抛 :class:`MixedCurrencyError`，流水号批内或与台账
+          重复抛 :class:`DuplicateTransactionError`，空债权清单抛
+          :class:`EmptyCreditorListError`，风险系数越界抛
+          :class:`InvalidRiskFactorError`，非法数值抛内建
+          :class:`ValueError`；异常不留半批状态（预演本就不产生状态）。
+        - 业务拒绝（余额不足 / 风险占用超限）不抛异常，逐笔表现为
+          ``approved=False``、给出 ``rejection_reason``、可用余额等于输入
+          余额、两层分配与坏账归因全为 0；放行、风险占用与坏账归因与正式
+          提交逐笔相同。
+
+        返回结构只含 ``results``（按请求顺序的 :class:`SettlementPreview`，
+        除无 ``event_id`` 外与 :class:`SettlementResult` 同名字段同义）与
+        ``validated_available_balance``（最终滚动余额）。预演只读、幂等：
+        随后以相同输入调用 :meth:`process_batch`，除每笔新增 ``event_id``
+        外，逐笔结果与最终余额一致。
+        """
+        _currency, opening, normalized = self._validate_batch(
+            currency, opening_pool_balance, requests
+        )
+
+        # 纯判定阶段：不登记流水号、不追加事件、不写坏账台账，故无需回滚。
+        previews: list[SettlementPreview] = []
+        balance = opening
+        for request in normalized:
+            request = replace(request, pool_balance=balance)
+            preview = self._evaluate(request)
+            previews.append(preview)
+            balance = preview.validated_available_balance
+
+        return BatchPreviewResult(
+            results=tuple(previews),
+            validated_available_balance=balance,
+        )
+
     def process_risk_group_batch(
         self,
         currency: str,
@@ -641,34 +706,34 @@ class ClearingEngine:
 
     def _execute(self, request: SettlementRequest) -> SettlementResult:
         """对已校验请求执行限额校验、清算与审计追加。"""
-        # 限额校验。拒绝时余额不变、无任何分配。
-        risk_occupancy = (
-            request.settlement_amount
-            + request.notional_exposure * request.risk_factor
-        )
         group_id = request.risk_group_id
-        if request.settlement_amount > request.pool_balance:
-            result = self._build_rejected(
-                request, risk_occupancy, "SETTLEMENT_EXCEEDS_AVAILABLE_BALANCE"
-            )
-        elif risk_occupancy > request.base_limit:
-            result = self._build_rejected(
-                request, risk_occupancy, "RISK_OCCUPANCY_EXCEEDS_BASE_LIMIT"
-            )
-        elif (
-            group_id is not None
-            and self._risk_group_used[group_id] + risk_occupancy
-            > self._risk_group_limits[group_id]
-        ):
-            result = self._build_rejected(
-                request, risk_occupancy, "GROUP_LIMIT_EXCEEDED"
-            )
+        if group_id is not None:
+            group_used = self._risk_group_used[group_id]
+            group_limit = self._risk_group_limits[group_id]
         else:
-            result = self._settle(request, risk_occupancy)
-            if group_id is not None:
-                # 组额度只在成功放行的请求上按其风险占用增加。
-                self._risk_group_used[group_id] += risk_occupancy
+            group_used = group_limit = None
 
+        preview = self._evaluate(request, group_used, group_limit)
+        if preview.approved and group_id is not None:
+            # 组额度只在成功放行的请求上按其风险占用增加。
+            self._risk_group_used[group_id] += preview.risk_occupancy
+
+        event_id = self._build_event_id(
+            request.transaction_id, approved=preview.approved
+        )
+        result = SettlementResult(
+            transaction_id=preview.transaction_id,
+            approved=preview.approved,
+            validated_available_balance=preview.validated_available_balance,
+            creditors=preview.creditors,
+            pool_allocations=preview.pool_allocations,
+            capital_allocations=preview.capital_allocations,
+            attributions=preview.attributions,
+            uncovered_bad_debt=preview.uncovered_bad_debt,
+            risk_occupancy=preview.risk_occupancy,
+            event_id=event_id,
+            rejection_reason=preview.rejection_reason,
+        )
         if group_id is not None:
             # 拒绝结果未占用额度：等于执行前值。
             result = replace(
@@ -677,6 +742,43 @@ class ClearingEngine:
 
         self._append_audit(request, result)
         return result
+
+    @staticmethod
+    def _evaluate(
+        request: SettlementRequest,
+        group_used: Decimal | None = None,
+        group_limit: Decimal | None = None,
+    ) -> SettlementPreview:
+        """对已校验请求做纯判定：限额校验与清算瀑布，不触碰任何台账状态。
+
+        返回 :class:`SettlementPreview`（无事件标识）；风险组判定仅在给出
+        ``group_used`` / ``group_limit`` 时参与。正式提交与只读预演共用本
+        判定，保证两者逐笔结果同源。
+        """
+        # 限额校验。拒绝时余额不变、无任何分配。
+        risk_occupancy = (
+            request.settlement_amount
+            + request.notional_exposure * request.risk_factor
+        )
+        group_id = request.risk_group_id
+        if request.settlement_amount > request.pool_balance:
+            return ClearingEngine._build_rejected_preview(
+                request, risk_occupancy, "SETTLEMENT_EXCEEDS_AVAILABLE_BALANCE"
+            )
+        if risk_occupancy > request.base_limit:
+            return ClearingEngine._build_rejected_preview(
+                request, risk_occupancy, "RISK_OCCUPANCY_EXCEEDS_BASE_LIMIT"
+            )
+        if (
+            group_id is not None
+            and group_used is not None
+            and group_limit is not None
+            and group_used + risk_occupancy > group_limit
+        ):
+            return ClearingEngine._build_rejected_preview(
+                request, risk_occupancy, "GROUP_LIMIT_EXCEEDED"
+            )
+        return ClearingEngine._settle_preview(request, risk_occupancy)
 
     # ------------------------------------------------------------------ #
     # 输入校验（不静默修正；异常路径不产生任何状态变更）
@@ -1263,13 +1365,17 @@ class ClearingEngine:
             remaining -= share
         return allocations
 
-    def _settle(
-        self, request: SettlementRequest, risk_occupancy: Decimal
-    ) -> SettlementResult:
+    @staticmethod
+    def _settle_preview(
+        request: SettlementRequest, risk_occupancy: Decimal
+    ) -> SettlementPreview:
+        """对通过限额校验的请求执行清算瀑布，构造无事件标识的预演结果。"""
         creditors = request.creditors
 
         # 第一层：资金池（本次拟清算金额）按优先顺序分配。
-        pool_allocations = self._waterfall(creditors, request.settlement_amount)
+        pool_allocations = ClearingEngine._waterfall(
+            creditors, request.settlement_amount
+        )
 
         # 第二层：补充资本按清单顺序补足仍未受偿的债权。
         residual_claims = [
@@ -1304,8 +1410,7 @@ class ClearingEngine:
         total_pool = sum(pool_allocations, _ZERO)
         validated_balance = request.pool_balance - total_pool
 
-        event_id = self._build_event_id(request.transaction_id, approved=True)
-        return SettlementResult(
+        return SettlementPreview(
             transaction_id=request.transaction_id,
             approved=True,
             validated_available_balance=validated_balance,
@@ -1315,16 +1420,16 @@ class ClearingEngine:
             attributions=tuple(attributions),
             uncovered_bad_debt=uncovered_total,
             risk_occupancy=risk_occupancy,
-            event_id=event_id,
             rejection_reason=None,
         )
 
-    def _build_rejected(
-        self,
+    @staticmethod
+    def _build_rejected_preview(
         request: SettlementRequest,
         risk_occupancy: Decimal,
         reason: str,
-    ) -> SettlementResult:
+    ) -> SettlementPreview:
+        """构造拒绝路径的无事件标识预演：余额不变、分配与坏账全为 0。"""
         names = tuple(c.name for c in request.creditors)
         zeros = tuple(_ZERO for _ in request.creditors)
         attributions = tuple(
@@ -1338,8 +1443,7 @@ class ClearingEngine:
             )
             for c in request.creditors
         )
-        event_id = self._build_event_id(request.transaction_id, approved=False)
-        return SettlementResult(
+        return SettlementPreview(
             transaction_id=request.transaction_id,
             approved=False,
             validated_available_balance=request.pool_balance,
@@ -1349,7 +1453,6 @@ class ClearingEngine:
             attributions=attributions,
             uncovered_bad_debt=_ZERO,
             risk_occupancy=risk_occupancy,
-            event_id=event_id,
             rejection_reason=reason,
         )
 

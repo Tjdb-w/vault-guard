@@ -38,6 +38,7 @@ from .errors import (
 )
 from .models import (
     AuditEvent,
+    BatchPreviewResult,
     BatchSettlementResult,
     Creditor,
     CreditorAttribution,
@@ -48,6 +49,7 @@ from .models import (
     RecoveryResult,
     RiskGroupBatchResult,
     RiskGroupUsage,
+    SettlementPreview,
     SettlementRequest,
     SettlementResult,
 )
@@ -60,7 +62,9 @@ __all__ = [
     "process_settlement_multicurrency_batch",
     "SettlementRequest",
     "SettlementResult",
+    "SettlementPreview",
     "BatchSettlementResult",
+    "BatchPreviewResult",
     "RiskGroupUsage",
     "RiskGroupBatchResult",
     "MulticurrencyBatchResult",

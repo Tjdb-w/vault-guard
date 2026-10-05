@@ -95,6 +95,39 @@ batch = engine.process_batch(
 模块级 `vault_guard.process_settlement_batch(currency,
 opening_pool_balance, requests)` 使用一次性引擎返回结果，不跨批次去重。
 
+## 提交前只读预演
+
+`ClearingEngine.preview_batch(currency, opening_pool_balance, requests)` 在
+正式提交前只读预演同一币种多笔批次：输入、债权格式、币种、滚动余额与清算
+瀑布完全沿用 `process_batch`，区别仅在于只报告台账**当前**状态下的执行
+结果：
+
+```python
+preview = engine.preview_batch(
+    currency="USD",
+    opening_pool_balance=Decimal("100"),
+    requests=[ /* 与 process_batch 完全相同的请求映射 */ ],
+)
+```
+
+- 返回不可变 `BatchPreviewResult`，只含两个字段：`results`（按请求顺序的
+  `SettlementPreview`，除**无 `event_id`** 外与 `SettlementResult` 同名字段
+  同义）与 `validated_available_balance`（滚动预演后的最终余额）。
+- 业务拒绝（余额不足 / 风险占用超限）不抛异常：逐笔
+  `approved=False`、给出 `rejection_reason`、可用余额等于输入余额、两层
+  分配与坏账归因全为 0；放行、风险占用与坏账归因与正式提交逐笔相同。
+- 预演**只读、幂等**：不新增 `audit_log` / 事件、不占流水号，不改变
+  `result_of` / `has_transaction` / `recovery_of`、坏账余额与审计核对；
+  重复调用结果一致，也不代替 `process_batch` 提交。
+- 校验顺序与异常类型与 `process_batch` 完全一致：空批次 →
+  `EmptyBatchError`；缺币种 → `InvalidCurrencyError`；债权币种不一致 →
+  `MixedCurrencyError`；流水号批内或与台账重复 →
+  `DuplicateTransactionError`；空债权清单 / 风险系数越界 →
+  `EmptyCreditorListError` / `InvalidRiskFactorError`；错误数值 →
+  `ValueError`；异常不留半批状态（预演本就不产生状态）。
+- 随后用相同输入调用 `process_batch`，除每笔新增 `event_id` 外，逐笔结果
+  与最终余额一致（预演不占流水号，故同号请求可在同一引擎继续提交）。
+
 ## 多币种批次结算
 
 `ClearingEngine.process_multicurrency_batch(opening_pool_balances,
@@ -205,6 +238,10 @@ recovery = engine.process_recovery("RC-001", "USD", Decimal("25"))
 | `risk_occupancy` | 风险占用 |
 | `event_id` | 本请求唯一审计事件标识 |
 | `rejection_reason` | 拒绝原因码，放行时为 `None` |
+
+`preview_batch` 返回的 `SettlementPreview` 与上表同名字段完全同义，仅不含
+`event_id`（预演不产生审计事件）；`BatchPreviewResult` 只含 `results` 与
+`validated_available_balance`，没有 `event_ids`。
 
 ## 异常类型
 

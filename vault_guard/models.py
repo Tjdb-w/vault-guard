@@ -13,7 +13,9 @@ __all__ = [
     "SettlementRequest",
     "CreditorAttribution",
     "SettlementResult",
+    "SettlementPreview",
     "BatchSettlementResult",
+    "BatchPreviewResult",
     "RiskGroupUsage",
     "RiskGroupBatchResult",
     "MulticurrencyBatchResult",
@@ -114,6 +116,35 @@ class SettlementResult:
 
 
 @dataclass(frozen=True)
+class SettlementPreview:
+    """只读预演的单笔结果（不可变）。
+
+    除无 ``event_id`` 外，各字段与 :class:`SettlementResult` 同名字段同义；
+    业务拒绝不抛异常，表现为 ``approved=False``、``rejection_reason`` 给因
+    果码、可用余额等于输入余额、两层分配与坏账归因全为 0。
+    """
+
+    transaction_id: str
+    approved: bool
+    validated_available_balance: Decimal
+    creditors: tuple[str, ...]
+    pool_allocations: tuple[Decimal, ...]
+    capital_allocations: tuple[Decimal, ...]
+    attributions: tuple[CreditorAttribution, ...]
+    uncovered_bad_debt: Decimal
+    risk_occupancy: Decimal
+    rejection_reason: str | None
+
+    @property
+    def total_pool_allocated(self) -> Decimal:
+        return sum(self.pool_allocations, Decimal(0))
+
+    @property
+    def total_capital_allocated(self) -> Decimal:
+        return sum(self.capital_allocations, Decimal(0))
+
+
+@dataclass(frozen=True)
 class BatchSettlementResult:
     """多笔批次结算的公开返回结构（不可变）。
 
@@ -125,6 +156,24 @@ class BatchSettlementResult:
 
     results: tuple[SettlementResult, ...]
     event_ids: tuple[str, ...]
+    validated_available_balance: Decimal
+
+
+@dataclass(frozen=True)
+class BatchPreviewResult:
+    """多笔批次提交前只读预演的公开返回结构（不可变）。
+
+    - ``results``：与批次 ``requests`` 同序的单笔
+      :class:`SettlementPreview`（无 ``event_id``）。
+    - ``validated_available_balance``：全部请求按滚动余额预演完毕后的最终
+      可用余额。
+
+    预演不生成审计事件、不占流水号、不写入任何台账；随后以相同输入调用
+    :meth:`~vault_guard.engine.ClearingEngine.process_batch`，除每笔新增
+    ``event_id`` 外，逐笔结果与最终余额一致。
+    """
+
+    results: tuple[SettlementPreview, ...]
     validated_available_balance: Decimal
 
 
