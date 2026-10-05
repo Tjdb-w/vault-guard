@@ -20,6 +20,7 @@ __all__ = [
     "RecoveryAllocation",
     "RecoveryResult",
     "OutstandingBadDebt",
+    "CurrencyAuditSummary",
     "AuditEvent",
 ]
 
@@ -223,6 +224,41 @@ class OutstandingBadDebt:
     creditor: str
     currency: str
     balance: Decimal
+
+
+@dataclass(frozen=True)
+class CurrencyAuditSummary:
+    """单币种审计核对快照（不可变，只读查询结果）。
+
+    按审计顺序汇总该币种事件：
+
+    - ``settlement_count``：结算事件总数（放行与拒绝）。
+    - ``approved_count`` / ``rejected_count``：放行 / 拒绝结算事件数。
+    - ``recovery_count``：回收事件数。
+    - ``approved_risk_occupancy``：仅放行请求的风险占用合计。
+    - ``pool_allocated``：放行请求池内分配按明细求和。
+    - ``capital_allocated``：放行请求补充资本按明细求和。
+    - ``initial_bad_debt``：放行时确认的首次坏账（未覆盖坏账）合计。
+    - ``recovered_amount``：回收冲减额合计。
+    - ``outstanding_bad_debt``：该币种存续坏账余额合计，恒等于
+      ``initial_bad_debt - recovered_amount``。
+    - ``rejection_counts``：按原因码排序的不可变原因次数（省略零次原因）。
+    - ``event_ids``：该币种全部审计事件标识，保持台账顺序。
+    """
+
+    currency: str
+    settlement_count: int
+    approved_count: int
+    rejected_count: int
+    recovery_count: int
+    approved_risk_occupancy: Decimal
+    pool_allocated: Decimal
+    capital_allocated: Decimal
+    initial_bad_debt: Decimal
+    recovered_amount: Decimal
+    outstanding_bad_debt: Decimal
+    rejection_counts: Mapping[str, int]
+    event_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True)

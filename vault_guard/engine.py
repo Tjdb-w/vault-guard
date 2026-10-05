@@ -68,6 +68,7 @@ from .models import (
     BatchSettlementResult,
     Creditor,
     CreditorAttribution,
+    CurrencyAuditSummary,
     MulticurrencyBatchResult,
     OutstandingBadDebt,
     RecoveryAllocation,
@@ -137,7 +138,8 @@ class ClearingEngine:
 
     审计台账为实例内内存中的追加式序列（``self.audit_log``），只读查询
     （:meth:`get_event` / :meth:`events` / :meth:`result_of` /
-    :meth:`recovery_of` / :meth:`outstanding_bad_debts`）不触发清算。
+    :meth:`recovery_of` / :meth:`outstanding_bad_debts` /
+    :meth:`audit_reconciliation`）不触发清算。
     """
 
     def __init__(self) -> None:
@@ -202,6 +204,93 @@ class ClearingEngine:
 
     def has_transaction(self, transaction_id: str) -> bool:
         return transaction_id in self._seen_transactions
+
+    def audit_reconciliation(self, currency: str) -> CurrencyAuditSummary:
+        """返回该币种的只读审计核对快照 :class:`CurrencyAuditSummary`。
+
+        按审计顺序（台账追加顺序）统计该币种事件：结算事件计入
+        ``settlement_count`` 并分别汇总放行 / 拒绝；回收事件计入
+        ``recovery_count``。风险占用仅累计放行请求；池内分配、补充资本、
+        首次坏账与回收冲减均按事件内明细求和。``outstanding_bad_debt``
+        取 :meth:`outstanding_bad_debts` 余额合计，恒满足
+        ``initial_bad_debt - recovered_amount == outstanding_bad_debt``。
+        ``rejection_counts`` 为按原因码排序的只读映射，省略零次原因；
+        ``event_ids`` 保持台账顺序。
+
+        查询只读：重复调用不改变审计序号、事件、结果索引、风险组额度、
+        坏账与回收状态。``currency`` 非字符串或去首尾空白后为空抛
+        :class:`InvalidCurrencyError`；匹配时去除首尾空白；未出现的币种
+        除 ``currency`` 外全部为零、两序列为空。
+        """
+        if not isinstance(currency, str) or not currency.strip():
+            raise InvalidCurrencyError("账户币种缺失或为空")
+        currency = currency.strip()
+
+        settlement_count = 0
+        approved_count = 0
+        rejected_count = 0
+        recovery_count = 0
+        approved_risk_occupancy = _ZERO
+        pool_allocated = _ZERO
+        capital_allocated = _ZERO
+        initial_bad_debt = _ZERO
+        recovered_amount = _ZERO
+        rejection_counts: dict[str, int] = {}
+        event_ids: list[str] = []
+
+        for event in self._events:
+            if event.currency != currency:
+                continue
+            event_ids.append(event.event_id)
+            if event.validation_result == "RECOVERY":
+                recovery_count += 1
+                recovered_amount += sum(
+                    (allocation[2] for allocation in event.recovery_allocations),
+                    _ZERO,
+                )
+                continue
+
+            settlement_count += 1
+            if event.approved:
+                approved_count += 1
+                approved_risk_occupancy += event.risk_occupancy
+                pool_allocated += sum(
+                    (amount for _name, amount in event.pool_allocations),
+                    _ZERO,
+                )
+                capital_allocated += sum(
+                    (amount for _name, amount in event.capital_allocations),
+                    _ZERO,
+                )
+                initial_bad_debt += event.uncovered_bad_debt
+            else:
+                rejected_count += 1
+                reason = event.rejection_reason
+                if reason is not None:
+                    rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+
+        outstanding_bad_debt = sum(
+            (item.balance for item in self.outstanding_bad_debts(currency)),
+            _ZERO,
+        )
+
+        return CurrencyAuditSummary(
+            currency=currency,
+            settlement_count=settlement_count,
+            approved_count=approved_count,
+            rejected_count=rejected_count,
+            recovery_count=recovery_count,
+            approved_risk_occupancy=approved_risk_occupancy,
+            pool_allocated=pool_allocated,
+            capital_allocated=capital_allocated,
+            initial_bad_debt=initial_bad_debt,
+            recovered_amount=recovered_amount,
+            outstanding_bad_debt=outstanding_bad_debt,
+            rejection_counts=MappingProxyType(
+                dict(sorted(rejection_counts.items()))
+            ),
+            event_ids=tuple(event_ids),
+        )
 
     # ------------------------------------------------------------------ #
     # 公开入口
