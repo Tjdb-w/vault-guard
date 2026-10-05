@@ -7,6 +7,10 @@
   同一币种的多笔批次结算入口；
 - :meth:`ClearingEngine.preview_batch`：同币种批次的提交前只读预演入口
   （不生成审计事件、不占流水号、不改台账状态）；
+- :meth:`ClearingEngine.preview_risk_group_batch` /
+  :meth:`ClearingEngine.preview_multicurrency_batch`：分别为风险组批次与
+  多币种批次的提交前只读预演入口（同样不生成事件、不占流水号、不改台账
+  与风险组额度）；
 - :meth:`ClearingEngine.process_risk_group_batch` /
   :func:`process_settlement_risk_group_batch`：带风险组累计限额的批次入口；
 - :meth:`ClearingEngine.process_multicurrency_batch` /
@@ -46,10 +50,12 @@ from .models import (
     CreditorAttribution,
     CurrencyAuditSummary,
     MulticurrencyBatchResult,
+    MulticurrencyBatchPreviewResult,
     OutstandingBadDebt,
     RecoveryAllocation,
     RecoveryResult,
     RiskGroupBatchResult,
+    RiskGroupBatchPreviewResult,
     RiskGroupUsage,
     SettlementPreview,
     SettlementRequest,
@@ -69,7 +75,9 @@ __all__ = [
     "BatchPreviewResult",
     "RiskGroupUsage",
     "RiskGroupBatchResult",
+    "RiskGroupBatchPreviewResult",
     "MulticurrencyBatchResult",
+    "MulticurrencyBatchPreviewResult",
     "RecoveryAllocation",
     "RecoveryResult",
     "OutstandingBadDebt",

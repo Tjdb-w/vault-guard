@@ -97,24 +97,53 @@ opening_pool_balance, requests)` 使用一次性引擎返回结果，不跨批�
 
 ### 提交前只读预演
 
-`ClearingEngine.preview_batch(currency, opening_pool_balance, requests)` 以
-与 `process_batch` 相同的输入、校验顺序、异常类型、滚动余额与清算瀑布做
-只读预演，只报告当前台账下的执行结果，不代替提交：
+三个预演入口分别与对应的正式批次入口使用相同的输入、校验顺序、异常类型、
+滚动余额与清算瀑布做只读预演，只报告当前台账下的执行结果，不代替提交：
 
 ```python
+# 同币种批次，对应 process_batch
 preview = engine.preview_batch("USD", Decimal("100"), requests)
+
+# 风险组批次，对应 process_risk_group_batch
+preview = engine.preview_risk_group_batch(
+    "USD", Decimal("100"), {"G1": Decimal("100")}, requests
+)
+
+# 多币种批次，对应 process_multicurrency_batch
+preview = engine.preview_multicurrency_batch(
+    {"USD": Decimal("100"), "EUR": Decimal("50")}, requests
+)
 ```
 
-- 返回不可变的 `BatchPreviewResult`：`results` 为与 `requests` 同序的
-  `SettlementPreview`（除无 `event_id` 外与 `SettlementResult` 同名字段
-  同义），`validated_available_balance` 为预演最终余额；不生成审计事件，
-  因此没有 `event_ids`。
+- 逐笔返回 `SettlementPreview`（除无 `event_id` 外与 `SettlementResult`
+  同名字段同义），与 `requests` 同序；预演不生成审计事件，因此返回结构都
+  没有 `event_ids`：
+  - `preview_batch` → 不可变 `BatchPreviewResult`，另含预演最终余额
+    `validated_available_balance`；
+  - `preview_risk_group_batch` → 不可变 `RiskGroupBatchPreviewResult`，
+    另含最终余额与 `risk_groups` 快照；
+  - `preview_multicurrency_batch` → 不可变
+    `MulticurrencyBatchPreviewResult`，另含覆盖全部期初币种的
+    `validated_available_balances`。
+- 风险组预演从已登记组的 `used` 起算，按请求顺序只累计会放行的风险占用：
+  `GROUP_LIMIT_EXCEEDED`、余额不足与基础限额拒绝沿用各自原原因码，拒绝不
+  增组额度（带组笔的 `group_used_after` 等于执行前值），无风险组请求只走
+  单笔规则。`risk_groups` 合并本次输入风险组与引擎已登记组，每项含
+  `used` / `limit` / `remaining`，未在本批使用的组保留已登记已用额度；
+  同组上限冲突、未登记组、空组标识或非法上限抛 `InvalidRiskGroupError`。
+- 多币种预演各币种余额独立滚动，不换汇、不使用汇率；未使用币种在
+  `validated_available_balances` 中保留期初原值。
 - 只读且幂等：不追加 `audit_log` 事件、不占流水号、不改变 `result_of` /
-  `has_transaction` / `recovery_of` / 坏账余额与审计核对。
+  `has_transaction` / `recovery_of` / 余额、风险组额度、坏账余额与审计
+  核对；重复或交叉调用结果一致。
 - 业务拒绝不抛异常，对应项给出 `approved=False`、`rejection_reason`、输入
   余额与零分配；放行、风险占用与坏账归因同正式提交。
-- 以相同输入随后调用 `process_batch`，逐笔结果与余额除新增 `event_id`
-  外一致。
+- 校验失败（含空批次 `EmptyBatchError`、缺币种 `InvalidCurrencyError`、
+  混合币种 `MixedCurrencyError`、重复流水号 `DuplicateTransactionError`、
+  空债权清单 `EmptyCreditorListError`、风险系数越界
+  `InvalidRiskFactorError`、非法金额 `ValueError`）不留任何状态。
+- 以相同输入随后调用对应正式入口，逐笔状态、拒绝原因、`group_used_after`、
+  余额与风险组额度与预演一致，正式结果只增 `event_id` 并写台账。
 
 ## 多币种批次结算
 
