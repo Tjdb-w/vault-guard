@@ -7,10 +7,12 @@
 本仓库从零开始实现上述方向的可用工具，不依赖外部同类实现，仅使用 Python
 标准库（要求 Python 3.10+）。
 
-当前版本兼容范围限定为**同一币种**的结算请求：单笔走 `process`，多笔批次
-走 `process_batch`（批次内共享币种与滚动余额）；多币种换算与外部定价不
-在范围内，请求内出现混合币种直接抛出 `MixedCurrencyError`。无任何落盘
-行为，审计台账以内存中的追加式序列表示。
+结算请求默认在**同一币种**内处理：单笔走 `process`，多笔批次走
+`process_batch`（批次内共享币种与滚动余额）；多币种批次走
+`process_multicurrency_batch`（每个请求自带币种，按币种独立记账，不换汇、
+不使用汇率）。外部定价与货币换算不在范围内，单笔请求内出现混合币种直接
+抛出 `MixedCurrencyError`。无任何落盘行为，审计台账以内存中的追加式序列
+表示。
 
 ## 公开入口
 
@@ -92,6 +94,57 @@ batch = engine.process_batch(
 
 模块级 `vault_guard.process_settlement_batch(currency,
 opening_pool_balance, requests)` 使用一次性引擎返回结果，不跨批次去重。
+
+## 多币种批次结算
+
+`ClearingEngine.process_multicurrency_batch(opening_pool_balances,
+requests)` 在同一批次内按币种独立记账处理多笔结算，不换汇、不使用汇率：
+
+```python
+batch = engine.process_multicurrency_batch(
+    opening_pool_balances={           # 币种 -> 非负期初资金池余额
+        "USD": Decimal("100"),
+        "EUR": Decimal("50"),
+    },
+    requests=[
+        {   # 字段沿用 process_batch 单项，并增加 currency
+            "transaction_id": "TX-201",
+            "currency": "USD",        # 必须存在于期初余额映射
+            "settlement_amount": Decimal("40"),
+            "notional_exposure": Decimal("0"),
+            "base_limit": Decimal("100"),
+            "risk_factor": Decimal("0"),
+            "creditors": [("senior", Decimal("60"))],
+        },
+        # ... 后续请求，可混排不同币种
+    ],
+)
+```
+
+- 每个请求只动用自身币种的滚动余额：放行按池内实际分配扣款，拒绝不动
+  余额；各币种互不影响。
+- 批次先做整体校验再执行；校验失败不生成事件、不占流水号、不改余额或
+  坏账台账，修正后可整体重提。
+- 异常顺序：空请求清单 → `EmptyBatchError`；期初映射非法、余额键空白或
+  任何数值非法 → `ValueError`；请求币种缺失、空白或不在期初映射中 →
+  `InvalidCurrencyError`；单笔债权混合币种 → `MixedCurrencyError`；
+  流水号批内或与台账重复 → `DuplicateTransactionError`；空债权清单 →
+  `EmptyCreditorListError`；风险系数越界 → `InvalidRiskFactorError`。
+- 逐笔规则（限额、瀑布、补充资本、坏账归因、两种拒绝原因码）与单币种
+  批次一致；放行或拒绝各产生一条既有结构审计事件，拒绝后继续处理。
+- 未覆盖坏账按各自币种进入存续坏账台账，可由 `process_recovery` 冲减。
+
+返回不可变的 `MulticurrencyBatchResult`：
+
+| 字段 | 含义 |
+| --- | --- |
+| `results` | 与 `requests` 同序的 `SettlementResult` 元组；每笔的 `validated_available_balance` 为本币种执行后的即时余额 |
+| `event_ids` | 与 `results` 同序的审计事件标识 |
+| `validated_available_balances` | 全部币种到最终可用余额的只读映射；未被请求使用的币种保留期初原值 |
+
+模块级 `vault_guard.process_settlement_multicurrency_batch(
+opening_pool_balances, requests)` 使用一次性引擎返回结果，不跨批次保留
+状态。
 
 ## 处理规则（确定顺序）
 

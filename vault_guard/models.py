@@ -16,6 +16,7 @@ __all__ = [
     "BatchSettlementResult",
     "RiskGroupUsage",
     "RiskGroupBatchResult",
+    "MulticurrencyBatchResult",
     "RecoveryAllocation",
     "RecoveryResult",
     "OutstandingBadDebt",
@@ -157,6 +158,22 @@ class RiskGroupBatchResult:
     event_ids: tuple[str, ...]
     validated_available_balance: Decimal
     risk_groups: Mapping[str, RiskGroupUsage]
+
+
+@dataclass(frozen=True)
+class MulticurrencyBatchResult:
+    """多币种批次结算的公开返回结构（不可变）。
+
+    - ``results``：与批次 ``requests`` 同序的单笔 :class:`SettlementResult`；
+      每笔的 ``validated_available_balance`` 为本币种执行后的即时余额。
+    - ``event_ids``：与 ``results`` 同序的审计事件标识；批次本身不产生事件。
+    - ``validated_available_balances``：全部币种到最终可用余额的只读映射；
+      未被任何请求使用的币种保留期初原值。
+    """
+
+    results: tuple[SettlementResult, ...]
+    event_ids: tuple[str, ...]
+    validated_available_balances: Mapping[str, Decimal]
 
 
 @dataclass(frozen=True)
