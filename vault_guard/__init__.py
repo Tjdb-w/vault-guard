@@ -12,6 +12,10 @@
   批次入口（不换汇、不使用汇率）；
 - :meth:`ClearingEngine.process_recovery`：存续坏账回收入口（回收依赖台账
   状态，仅提供引擎方法，无模块级一次性入口）；
+- 只读单币种审计核对入口
+  :meth:`ClearingEngine.audit_reconciliation(currency)
+  <vault_guard.engine.ClearingEngine.audit_reconciliation>`：返回不可变
+  :class:`~vault_guard.models.CurrencyAuditSummary`，不触发清算、不落盘；
 - :class:`~vault_guard.models.SettlementRequest` 等数据模型；
 - :mod:`vault_guard.errors` 中定义的各类异常（负数使用内建
   :class:`ValueError`）。
@@ -41,6 +45,7 @@ from .models import (
     BatchSettlementResult,
     Creditor,
     CreditorAttribution,
+    CurrencyAuditSummary,
     MulticurrencyBatchResult,
     OutstandingBadDebt,
     RecoveryAllocation,
@@ -69,6 +74,7 @@ __all__ = [
     "Creditor",
     "CreditorAttribution",
     "AuditEvent",
+    "CurrencyAuditSummary",
     "VaultGuardError",
     "DuplicateTransactionError",
     "InvalidCurrencyError",

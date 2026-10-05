@@ -232,7 +232,34 @@ recovery = engine.process_recovery("RC-001", "USD", Decimal("25"))
   `engine.get_event(transaction_id)`、`engine.result_of(transaction_id)`、
   `engine.recovery_of(recovery_transaction_id)`、
   `engine.outstanding_bad_debts(currency)`、
+  `engine.audit_reconciliation(currency)`、
   `engine.has_transaction(transaction_id)`。
+
+## 单币种审计核对快照
+
+`ClearingEngine.audit_reconciliation(currency)` 在既有台账上返回不可变的
+`CurrencyAuditSummary`，把限额拒绝、清算分配、坏账形成与回收冲减放在同一
+口径中核对；纯只读、不落盘，不触发清算，重复调用不改变审计序号、事件、
+结果索引、风险组额度、坏账与回收状态。`currency` 非字符串或去首尾空白后
+为空时抛 `InvalidCurrencyError`，匹配时去除首尾空白。
+
+| 字段 | 含义 |
+| --- | --- |
+| `currency` | 去空白后的查询币种 |
+| `settlement_count` | 该币种结算事件总数（放行 + 拒绝，不含回收） |
+| `approved_count` / `rejected_count` / `recovery_count` | 放行、拒绝、回收事件数 |
+| `approved_risk_occupancy` | 仅放行请求的风险占用合计（拒绝不占用） |
+| `pool_allocated` | 放行事件各债权池内分配明细求和 |
+| `capital_allocated` | 放行事件各债权资本分配明细求和 |
+| `initial_bad_debt` | 放行事件形成的首次坏账（未覆盖坏账）合计 |
+| `recovered_amount` | 回收事件按冲减明细求和的回收冲减总额 |
+| `outstanding_bad_debt` | 查询时点该币种存续坏账余额合计，等于 `outstanding_bad_debts(currency)` 余额合计 |
+| `rejection_counts` | 按原因码排序的只读原因 -> 次数映射，省略零次原因 |
+| `event_ids` | 按台账顺序排列的该币种全部事件标识 |
+
+恒等关系：`initial_bad_debt - recovered_amount == outstanding_bad_debt`。
+台账中未出现的币种除 `currency` 外全部计数与金额为 `0`，
+`rejection_counts` 与 `event_ids` 为空序列；空台账的查询结果同样确定。
 
 ## 测试
 

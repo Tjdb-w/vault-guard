@@ -21,6 +21,7 @@ __all__ = [
     "RecoveryResult",
     "OutstandingBadDebt",
     "AuditEvent",
+    "CurrencyAuditSummary",
 ]
 
 
@@ -248,3 +249,41 @@ class AuditEvent:
     # 回收事件的冲减明细：
     # (来源结算流水号, 债权名, 本次冲减额, 剩余坏账)；结算事件恒为空元组。
     recovery_allocations: tuple[tuple[str, str, Decimal, Decimal], ...] = ()
+
+
+@dataclass(frozen=True)
+class CurrencyAuditSummary:
+    """单币种只读审计核对快照（不可变）。
+
+    按审计顺序统计该币种全部事件（结算放行 / 拒绝与存续坏账回收），将
+    限额拒绝、清算分配、坏账形成与回收冲减纳入同一口径核对：
+
+    - ``settlement_count``：结算事件总数（放行 + 拒绝，不含回收事件）。
+    - ``approved_count`` / ``rejected_count`` / ``recovery_count``：
+      放行、拒绝、回收事件数。
+    - ``approved_risk_occupancy``：仅累计放行结算请求的风险占用。
+    - ``pool_allocated`` / ``capital_allocated``：仅放行事件各层分配
+      明细求和；拒绝不分配资金。
+    - ``initial_bad_debt``：放行事件形成的首次坏账（未覆盖坏账）合计。
+    - ``recovered_amount``：回收事件按冲减明细求和的回收冲减总额。
+    - ``outstanding_bad_debt``：查询时点该币种存续坏账余额合计，恒等于
+      :meth:`ClearingEngine.outstanding_bad_debts` 同币种余额合计，并满足
+      ``initial_bad_debt - recovered_amount == outstanding_bad_debt``。
+    - ``rejection_counts``：按原因码排序的只读原因 -> 次数映射，省略
+      零次原因。
+    - ``event_ids``：按台账（审计）顺序排列的该币种全部事件标识。
+    """
+
+    currency: str
+    settlement_count: int
+    approved_count: int
+    rejected_count: int
+    recovery_count: int
+    approved_risk_occupancy: Decimal
+    pool_allocated: Decimal
+    capital_allocated: Decimal
+    initial_bad_debt: Decimal
+    recovered_amount: Decimal
+    outstanding_bad_debt: Decimal
+    rejection_counts: Mapping[str, int]
+    event_ids: tuple[str, ...]

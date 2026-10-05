@@ -43,6 +43,11 @@
 不改状态。
 
 校验异常不产生任何分配，也不写入台账；重复流水号在任何状态变更之前抛出。
+
+只读单币种审计核对（:meth:`ClearingEngine.audit_reconciliation`）不落盘、
+不触发清算：按审计顺序汇总指定币种的放行、拒绝与回收事件，返回不可变
+:class:`~vault_guard.models.CurrencyAuditSummary`，将限额拒绝、清算分配、
+首次坏账与回收冲减纳入同一口径核对；重复调用不改变任何既有状态。
 """
 
 from collections.abc import Iterable, Mapping, Sequence
@@ -68,6 +73,7 @@ from .models import (
     BatchSettlementResult,
     Creditor,
     CreditorAttribution,
+    CurrencyAuditSummary,
     MulticurrencyBatchResult,
     OutstandingBadDebt,
     RecoveryAllocation,
@@ -137,7 +143,8 @@ class ClearingEngine:
 
     审计台账为实例内内存中的追加式序列（``self.audit_log``），只读查询
     （:meth:`get_event` / :meth:`events` / :meth:`result_of` /
-    :meth:`recovery_of` / :meth:`outstanding_bad_debts`）不触发清算。
+    :meth:`recovery_of` / :meth:`outstanding_bad_debts` /
+    :meth:`audit_reconciliation`）不触发清算。
     """
 
     def __init__(self) -> None:
@@ -202,6 +209,100 @@ class ClearingEngine:
 
     def has_transaction(self, transaction_id: str) -> bool:
         return transaction_id in self._seen_transactions
+
+    def audit_reconciliation(self, currency: str) -> CurrencyAuditSummary:
+        """返回该币种的只读审计核对快照 :class:`CurrencyAuditSummary`。
+
+        按审计台账顺序统计该币种事件，把限额拒绝、清算分配、坏账形成与
+        回收冲减放在同一口径中核对：
+
+        - ``settlement_count`` 为结算事件总数（放行 + 拒绝，不含回收），
+          其余计数分别汇总放行、拒绝与回收事件；
+        - 风险占用仅累计放行请求，拒绝请求不占用；
+        - 池内分配、资本分配按放行事件的各层明细求和，首次坏账按放行
+          事件的未覆盖坏账求和，回收冲减按回收事件的冲减明细求和；
+        - ``outstanding_bad_debt`` 等于
+          :meth:`outstanding_bad_debts` 同币种余额合计，并满足
+          ``initial_bad_debt - recovered_amount == outstanding_bad_debt``；
+        - ``rejection_counts`` 为按原因码排序的只读映射，省略零次原因；
+        - ``event_ids`` 保持台账顺序。
+
+        纯只读：重复调用不改变审计序号、事件、结果索引、风险组额度、
+        坏账与回收状态。``currency`` 非字符串或去首尾空白后为空时抛
+        :class:`InvalidCurrencyError`；匹配时去除首尾空白；台账中未出现
+        的币种除 ``currency`` 外全部字段为零值、两个序列为空。
+        """
+        if not isinstance(currency, str) or not currency.strip():
+            raise InvalidCurrencyError("账户币种缺失或为空")
+        currency = currency.strip()
+
+        settlement_count = 0
+        approved_count = 0
+        rejected_count = 0
+        recovery_count = 0
+        approved_risk_occupancy = _ZERO
+        pool_allocated = _ZERO
+        capital_allocated = _ZERO
+        initial_bad_debt = _ZERO
+        recovered_amount = _ZERO
+        rejection_counter: dict[str, int] = {}
+        event_ids: list[str] = []
+
+        for event in self._events:
+            if event.currency != currency:
+                continue
+            event_ids.append(event.event_id)
+            if event.validation_result == "RECOVERY":
+                recovery_count += 1
+                recovered_amount += sum(
+                    (allocation[2] for allocation in event.recovery_allocations),
+                    _ZERO,
+                )
+                continue
+
+            settlement_count += 1
+            if event.approved:
+                approved_count += 1
+                approved_risk_occupancy += event.risk_occupancy
+                pool_allocated += sum(
+                    (amount for _name, amount in event.pool_allocations),
+                    _ZERO,
+                )
+                capital_allocated += sum(
+                    (amount for _name, amount in event.capital_allocations),
+                    _ZERO,
+                )
+                initial_bad_debt += event.uncovered_bad_debt
+            else:
+                rejected_count += 1
+                reason = event.rejection_reason
+                if reason is not None:
+                    rejection_counter[reason] = rejection_counter.get(reason, 0) + 1
+
+        outstanding_bad_debt = sum(
+            (
+                entry.remaining
+                for entry in self._bad_debt_ledger
+                if entry.currency == currency and entry.remaining > _ZERO
+            ),
+            _ZERO,
+        )
+
+        return CurrencyAuditSummary(
+            currency=currency,
+            settlement_count=settlement_count,
+            approved_count=approved_count,
+            rejected_count=rejected_count,
+            recovery_count=recovery_count,
+            approved_risk_occupancy=approved_risk_occupancy,
+            pool_allocated=pool_allocated,
+            capital_allocated=capital_allocated,
+            initial_bad_debt=initial_bad_debt,
+            recovered_amount=recovered_amount,
+            outstanding_bad_debt=outstanding_bad_debt,
+            rejection_counts=MappingProxyType(dict(sorted(rejection_counter.items()))),
+            event_ids=tuple(event_ids),
+        )
 
     # ------------------------------------------------------------------ #
     # 公开入口
