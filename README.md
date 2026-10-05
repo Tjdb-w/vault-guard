@@ -95,6 +95,27 @@ batch = engine.process_batch(
 模块级 `vault_guard.process_settlement_batch(currency,
 opening_pool_balance, requests)` 使用一次性引擎返回结果，不跨批次去重。
 
+### 提交前只读预演
+
+`ClearingEngine.preview_batch(currency, opening_pool_balance, requests)` 以
+与 `process_batch` 相同的输入、校验顺序、异常类型、滚动余额与清算瀑布做
+只读预演，只报告当前台账下的执行结果，不代替提交：
+
+```python
+preview = engine.preview_batch("USD", Decimal("100"), requests)
+```
+
+- 返回不可变的 `BatchPreviewResult`：`results` 为与 `requests` 同序的
+  `SettlementPreview`（除无 `event_id` 外与 `SettlementResult` 同名字段
+  同义），`validated_available_balance` 为预演最终余额；不生成审计事件，
+  因此没有 `event_ids`。
+- 只读且幂等：不追加 `audit_log` 事件、不占流水号、不改变 `result_of` /
+  `has_transaction` / `recovery_of` / 坏账余额与审计核对。
+- 业务拒绝不抛异常，对应项给出 `approved=False`、`rejection_reason`、输入
+  余额与零分配；放行、风险占用与坏账归因同正式提交。
+- 以相同输入随后调用 `process_batch`，逐笔结果与余额除新增 `event_id`
+  外一致。
+
 ## 多币种批次结算
 
 `ClearingEngine.process_multicurrency_batch(opening_pool_balances,

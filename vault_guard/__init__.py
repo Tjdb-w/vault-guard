@@ -5,6 +5,8 @@
 - :class:`ClearingEngine` / :func:`process_settlement`：单笔清算入口；
 - :meth:`ClearingEngine.process_batch` / :func:`process_settlement_batch`：
   同一币种的多笔批次结算入口；
+- :meth:`ClearingEngine.preview_batch`：同币种批次的提交前只读预演入口
+  （不生成审计事件、不占流水号、不改台账状态）；
 - :meth:`ClearingEngine.process_risk_group_batch` /
   :func:`process_settlement_risk_group_batch`：带风险组累计限额的批次入口；
 - :meth:`ClearingEngine.process_multicurrency_batch` /
@@ -38,6 +40,7 @@ from .errors import (
 )
 from .models import (
     AuditEvent,
+    BatchPreviewResult,
     BatchSettlementResult,
     Creditor,
     CreditorAttribution,
@@ -48,6 +51,7 @@ from .models import (
     RecoveryResult,
     RiskGroupBatchResult,
     RiskGroupUsage,
+    SettlementPreview,
     SettlementRequest,
     SettlementResult,
 )
@@ -61,6 +65,8 @@ __all__ = [
     "SettlementRequest",
     "SettlementResult",
     "BatchSettlementResult",
+    "SettlementPreview",
+    "BatchPreviewResult",
     "RiskGroupUsage",
     "RiskGroupBatchResult",
     "MulticurrencyBatchResult",

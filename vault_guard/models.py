@@ -14,6 +14,8 @@ __all__ = [
     "CreditorAttribution",
     "SettlementResult",
     "BatchSettlementResult",
+    "SettlementPreview",
+    "BatchPreviewResult",
     "RiskGroupUsage",
     "RiskGroupBatchResult",
     "MulticurrencyBatchResult",
@@ -125,6 +127,50 @@ class BatchSettlementResult:
 
     results: tuple[SettlementResult, ...]
     event_ids: tuple[str, ...]
+    validated_available_balance: Decimal
+
+
+@dataclass(frozen=True)
+class SettlementPreview:
+    """单笔结算的只读预演结果（不可变）。
+
+    除不含 ``event_id`` 外，各字段与 :class:`SettlementResult` 同名同义；
+    预演不生成审计事件，因此没有事件标识。
+    """
+
+    transaction_id: str
+    approved: bool
+    validated_available_balance: Decimal
+    creditors: tuple[str, ...]
+    pool_allocations: tuple[Decimal, ...]
+    capital_allocations: tuple[Decimal, ...]
+    attributions: tuple[CreditorAttribution, ...]
+    uncovered_bad_debt: Decimal
+    risk_occupancy: Decimal
+    rejection_reason: str | None
+    group_used_after: Decimal | None = None
+
+    @property
+    def total_pool_allocated(self) -> Decimal:
+        return sum(self.pool_allocations, Decimal(0))
+
+    @property
+    def total_capital_allocated(self) -> Decimal:
+        return sum(self.capital_allocations, Decimal(0))
+
+
+@dataclass(frozen=True)
+class BatchPreviewResult:
+    """同币种多笔结算批次的只读预演结果（不可变）。
+
+    - ``results``：与批次 ``requests`` 同序的单笔 :class:`SettlementPreview`；
+      其中每笔的 ``validated_available_balance`` 为该笔预演执行后的即时余额。
+    - ``validated_available_balance``：批次全部请求预演完毕后的最终可用余额。
+
+    预演不生成审计事件，因此不含 ``event_ids``。
+    """
+
+    results: tuple[SettlementPreview, ...]
     validated_available_balance: Decimal
 
 
