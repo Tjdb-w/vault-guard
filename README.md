@@ -116,6 +116,74 @@ preview = engine.preview_batch("USD", Decimal("100"), requests)
 - 以相同输入随后调用 `process_batch`，逐笔结果与余额除新增 `event_id`
   外一致。
 
+## 风险组批次结算
+
+`ClearingEngine.process_risk_group_batch(currency, opening_pool_balance,
+risk_group_limits, requests)` 在同币种批次规则之上增加风险组累计限额：
+
+```python
+batch = engine.process_risk_group_batch(
+    currency="USD",
+    opening_pool_balance=Decimal("1000"),
+    risk_group_limits={                # 风险组标识 -> 非负上限
+        "G1": Decimal("100"),
+    },
+    requests=[
+        {   # 字段沿用 process_batch 单项，另可携带 risk_group_id
+            "transaction_id": "TX-301",
+            "risk_group_id": "G1",     # 缺省 / None 表示不参与组控
+            "settlement_amount": Decimal("40"),
+            "notional_exposure": Decimal("0"),
+            "base_limit": Decimal("1000"),
+            "risk_factor": Decimal("0"),
+            "creditors": [("senior", Decimal("60"))],
+        },
+    ],
+)
+```
+
+- 风险占用仍为 `拟清算金额 + 名义敞口 × 风险系数`，同一风险组跨请求、跨
+  批次按请求顺序累计**已放行请求**的风险占用；加入本笔后超过组上限的笔以
+  `GROUP_LIMIT_EXCEEDED` 拒绝（不分配资金、不改资金池、不确认坏账、不增加
+  已用额度），仍生成现有结构审计事件并继续后续请求。
+- 余额不足、单笔基础限额拒绝同样不占用组额度；不带风险组的请求只按单笔
+  基础限额处理，不同风险组互不影响。
+- 风险组标识为空、限额非法（非数值 / NaN / 无穷 / 负数）、引用未登记组，
+  或同一引擎对同一组给出与已登记不同的上限，均抛
+  `vault_guard.InvalidRiskGroupError`；其余异常类型与顺序沿用
+  `process_batch`。校验失败回退批内全部状态（含新组登记与组额度）。
+- 返回不可变 `RiskGroupBatchResult`：`results` / `event_ids` 同序，带组笔
+  另含 `group_used_after`（该笔执行后组内已用额度，拒绝等于执行前值），
+  `validated_available_balance` 为最终余额，`risk_groups` 为引擎已登记全部
+  风险组到 `RiskGroupUsage`（`used` / `limit` / `remaining`）的只读映射。
+
+模块级 `vault_guard.process_settlement_risk_group_batch(...)` 使用一次性
+引擎，不跨批次保留风险组状态。
+
+### 提交前只读预演
+
+`ClearingEngine.preview_risk_group_batch(currency, opening_pool_balance,
+risk_group_limits, requests)` 以相同输入、校验顺序与规则做只读预演：
+
+```python
+preview = engine.preview_risk_group_batch(
+    "USD", Decimal("1000"), {"G1": Decimal("100")}, requests
+)
+```
+
+- 从引擎**已登记组**的 `used` 起步，在工作副本上按请求顺序只累计会放行的
+  风险占用；`GROUP_LIMIT_EXCEEDED`、余额不足与基础限额拒绝沿用各自原原因
+  码，拒绝不增组额度。
+- 返回不可变 `RiskGroupBatchPreviewResult`：同序 `SettlementPreview`
+  （带组笔含 `group_used_after`）、`validated_available_balance` 与
+  `risk_groups` 快照；快照**合并本次输入风险组与引擎已登记组**，每项含
+  `used` / `limit` / `remaining`（本次新给上限的组 `used` 取已登记累计值，
+  未登记则为 0）。
+- 不生成审计事件、不占流水号、不登记新组或改变已登记额度、不改余额、坏账
+  台账与审计核对；重复或交叉调用幂等。
+- 以相同输入随后调用 `process_risk_group_batch`，逐笔状态、拒绝原因、
+  `group_used_after`、余额与组额度除新增 `event_id`（并写台账）外一致。
+
 ## 多币种批次结算
 
 `ClearingEngine.process_multicurrency_batch(opening_pool_balances,
@@ -166,6 +234,28 @@ batch = engine.process_multicurrency_batch(
 模块级 `vault_guard.process_settlement_multicurrency_batch(
 opening_pool_balances, requests)` 使用一次性引擎返回结果，不跨批次保留
 状态。
+
+### 提交前只读预演
+
+`ClearingEngine.preview_multicurrency_batch(opening_pool_balances,
+requests)` 以相同输入、校验顺序与清算规则做多币种只读预演：
+
+```python
+preview = engine.preview_multicurrency_batch(
+    {"USD": Decimal("100"), "EUR": Decimal("50")}, requests
+)
+```
+
+- 各币种余额在工作副本上**独立滚动**：放行按池内实际分配扣本币种余额，
+  拒绝不动本币种余额；不换汇、不使用汇率。
+- 返回不可变 `MulticurrencyBatchPreviewResult`：同序
+  `SettlementPreview`（每笔 `validated_available_balance` 为本币种预演后
+  即时余额）与 `validated_available_balances`，后者**覆盖全部期初币种**，
+  未被使用的币种保留期初原值。
+- 不生成审计事件、不占流水号、不改余额、坏账台账与审计核对；重复或交叉
+  调用幂等。
+- 以相同输入随后调用 `process_multicurrency_batch`，逐笔状态、拒绝原因、
+  各笔余额与各币种最终余额除新增 `event_id`（并写台账）外一致。
 
 ## 处理规则（确定顺序）
 
@@ -238,6 +328,7 @@ recovery = engine.process_recovery("RC-001", "USD", Decimal("25"))
 | 风险系数越界（< 0 或 > 1） | `vault_guard.InvalidRiskFactorError` |
 | 单笔请求内混合币种 | `vault_guard.MixedCurrencyError` |
 | 空批次请求清单 | `vault_guard.EmptyBatchError` |
+| 风险组标识为空、引用未登记组、限额非法或同组上限冲突 | `vault_guard.InvalidRiskGroupError` |
 | 回收币种无存续坏账（含此时零额回收） | `vault_guard.NoOutstandingBadDebtError` |
 | 回收额超过该币种存续坏账 | `vault_guard.RecoveryAmountExceedsOutstandingError` |
 

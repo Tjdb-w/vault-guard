@@ -18,7 +18,9 @@ __all__ = [
     "BatchPreviewResult",
     "RiskGroupUsage",
     "RiskGroupBatchResult",
+    "RiskGroupBatchPreviewResult",
     "MulticurrencyBatchResult",
+    "MulticurrencyBatchPreviewResult",
     "RecoveryAllocation",
     "RecoveryResult",
     "OutstandingBadDebt",
@@ -208,6 +210,26 @@ class RiskGroupBatchResult:
 
 
 @dataclass(frozen=True)
+class RiskGroupBatchPreviewResult:
+    """带风险组累计限额批次的只读预演结果（不可变）。
+
+    - ``results``：与批次 ``requests`` 同序的单笔 :class:`SettlementPreview`；
+      带风险组的每笔另含 ``group_used_after``（该笔预演放行累计后的组内已用
+      额度，未占用的拒绝结果等于预演执行前值），无风险组的笔为 ``None``。
+    - ``validated_available_balance``：批次全部请求预演完毕后的最终可用余额。
+    - ``risk_groups``：合并本次输入风险组与引擎已登记组后的 :class:`RiskGroupUsage`
+      快照（只读映射）；本次新给上限的组 ``used`` 取引擎已登记累计值，
+      未登记则为 0。
+
+    预演不生成审计事件，因此不含 ``event_ids``。
+    """
+
+    results: tuple[SettlementPreview, ...]
+    validated_available_balance: Decimal
+    risk_groups: Mapping[str, RiskGroupUsage]
+
+
+@dataclass(frozen=True)
 class MulticurrencyBatchResult:
     """多币种批次结算的公开返回结构（不可变）。
 
@@ -220,6 +242,22 @@ class MulticurrencyBatchResult:
 
     results: tuple[SettlementResult, ...]
     event_ids: tuple[str, ...]
+    validated_available_balances: Mapping[str, Decimal]
+
+
+@dataclass(frozen=True)
+class MulticurrencyBatchPreviewResult:
+    """多币种批次的只读预演结果（不可变）。
+
+    - ``results``：与批次 ``requests`` 同序的单笔 :class:`SettlementPreview`；
+      每笔的 ``validated_available_balance`` 为本币种预演执行后的即时余额。
+    - ``validated_available_balances``：覆盖全部期初币种的最终可用余额只读
+      映射；未被任何请求使用的币种保留期初原值。
+
+    预演不生成审计事件，因此不含 ``event_ids``。
+    """
+
+    results: tuple[SettlementPreview, ...]
     validated_available_balances: Mapping[str, Decimal]
 
 

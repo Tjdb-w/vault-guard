@@ -9,9 +9,14 @@
   （不生成审计事件、不占流水号、不改台账状态）；
 - :meth:`ClearingEngine.process_risk_group_batch` /
   :func:`process_settlement_risk_group_batch`：带风险组累计限额的批次入口；
+- :meth:`ClearingEngine.preview_risk_group_batch`：风险组批次的提交前只读
+  预演入口（从已登记组 used 起步模拟累计，不生成事件、不登记新组、不改
+  已登记额度）；
 - :meth:`ClearingEngine.process_multicurrency_batch` /
   :func:`process_settlement_multicurrency_batch`：按币种独立记账的多币种
   批次入口（不换汇、不使用汇率）；
+- :meth:`ClearingEngine.preview_multicurrency_batch`：多币种批次的提交前
+  只读预演入口（各币种余额独立滚动，不生成事件、不改任何状态）；
 - :meth:`ClearingEngine.process_recovery`：存续坏账回收入口（回收依赖台账
   状态，仅提供引擎方法，无模块级一次性入口）；
 - :class:`~vault_guard.models.SettlementRequest` 等数据模型；
@@ -46,10 +51,12 @@ from .models import (
     CreditorAttribution,
     CurrencyAuditSummary,
     MulticurrencyBatchResult,
+    MulticurrencyBatchPreviewResult,
     OutstandingBadDebt,
     RecoveryAllocation,
     RecoveryResult,
     RiskGroupBatchResult,
+    RiskGroupBatchPreviewResult,
     RiskGroupUsage,
     SettlementPreview,
     SettlementRequest,
@@ -69,7 +76,9 @@ __all__ = [
     "BatchPreviewResult",
     "RiskGroupUsage",
     "RiskGroupBatchResult",
+    "RiskGroupBatchPreviewResult",
     "MulticurrencyBatchResult",
+    "MulticurrencyBatchPreviewResult",
     "RecoveryAllocation",
     "RecoveryResult",
     "OutstandingBadDebt",

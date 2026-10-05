@@ -33,12 +33,23 @@
 已用额度），生成现有结构审计事件并继续处理后续请求。不带风险组的请求仍
 只按单笔基础限额处理。
 
+风险组预演（:meth:`ClearingEngine.preview_risk_group_batch`）以相同输入、
+校验顺序与规则做只读预演：从引擎已登记组的 ``used`` 起步，在工作副本上按
+请求顺序只累计会放行的风险占用；返回同序 :class:`SettlementPreview`、
+最终余额与合并输入风险组及已登记组的 ``risk_groups`` 快照。不生成审计
+事件、不占流水号、不登记新组或改变已登记额度，重复或交叉调用幂等。
+
 多币种批次（:meth:`ClearingEngine.process_multicurrency_batch`，模块级
 :func:`process_settlement_multicurrency_batch` 使用一次性引擎，不跨批次
 保留状态）在普通批次规则之上按币种独立记账：期初余额以币种到非负余额的
 映射给出，每个请求自带 ``currency`` 且必须存在于该映射；每笔只动用自身
 币种的滚动余额，放行扣款、拒绝不动余额，不换汇、不使用汇率。批次先整体
 校验再执行，失败不生成事件、不占流水号、不改余额或坏账台账。
+
+多币种预演（:meth:`ClearingEngine.preview_multicurrency_batch`）以相同
+输入与校验做只读预演：各币种余额在工作副本上独立滚动，返回同序
+:class:`SettlementPreview` 与覆盖全部期初币种的最终余额映射（未使用币种
+不变）；不生成审计事件、不占流水号、不改任何状态，重复或交叉调用幂等。
 
 存续坏账回收（:meth:`ClearingEngine.process_recovery`）只冲减已放行结算
 留下的未覆盖债权：按审计事件顺序、再按债权清单顺序逐项冲减币种相符且仍
@@ -77,10 +88,12 @@ from .models import (
     CreditorAttribution,
     CurrencyAuditSummary,
     MulticurrencyBatchResult,
+    MulticurrencyBatchPreviewResult,
     OutstandingBadDebt,
     RecoveryAllocation,
     RecoveryResult,
     RiskGroupBatchResult,
+    RiskGroupBatchPreviewResult,
     RiskGroupUsage,
     SettlementPreview,
     SettlementRequest,
@@ -521,6 +534,80 @@ class ClearingEngine:
             ),
         )
 
+    def preview_risk_group_batch(
+        self,
+        currency: str,
+        opening_pool_balance: Number,
+        risk_group_limits: Mapping[str, Number],
+        requests: Iterable[Mapping[str, object]],
+    ) -> RiskGroupBatchPreviewResult:
+        """对带风险组累计限额的同币种批次做提交前只读预演，返回不可变
+        :class:`RiskGroupBatchPreviewResult`。
+
+        输入、债权格式、校验顺序与异常类型沿用
+        :meth:`process_risk_group_batch`（空批次、缺币种、空 / 未登记风险组、
+        非法或冲突上限、流水号重复、空债权清单、风险系数越界、非法数值），
+        异常不留任何状态。
+
+        预演从引擎已登记组的 ``used`` 起步，按请求顺序在工作副本上只累计会
+        放行的风险占用：``GROUP_LIMIT_EXCEEDED``、余额不足与基础限额拒绝沿用
+        各自原原因码，拒绝不增组额度、不动余额、不确认坏账；无风险组请求只
+        走单笔规则。预演不登记本次新给上限的组，重复或交叉调用幂等：不生成
+        审计事件、不占流水号、不改余额、结果索引、已登记风险组额度、坏账
+        台账与审计核对。
+
+        返回与 ``requests`` 同序的 :class:`SettlementPreview`（带组笔含
+        ``group_used_after``）、最终余额，以及合并本次输入风险组与引擎已
+        登记组的 ``risk_groups`` 快照，每项含 ``used`` / ``limit`` /
+        ``remaining``。以相同输入随后调用 :meth:`process_risk_group_batch`，
+        逐笔状态、拒绝原因、``group_used_after``、余额与组额度除新增
+        ``event_id`` 外一致。
+        """
+        _, opening, normalized, new_limits = self._validate_risk_group_batch(
+            currency, opening_pool_balance, risk_group_limits, requests
+        )
+
+        # 组额度工作副本：合并引擎已登记累计值与本次新给上限的组（后者
+        # used 自 0 起）；仅用于本次纯计算，绝不写回引擎状态。
+        working_limits = dict(self._risk_group_limits)
+        working_used = dict(self._risk_group_used)
+        for group_id, limit in new_limits.items():
+            working_limits[group_id] = limit
+            working_used.setdefault(group_id, _ZERO)
+
+        results: list[SettlementPreview] = []
+        balance = opening
+        for request in normalized:
+            request = replace(request, pool_balance=balance)
+            preview = self._adjudicate(
+                request, group_used=working_used, group_limits=working_limits
+            )
+            group_id = request.risk_group_id
+            if group_id is not None:
+                if preview.approved:
+                    # 与正式提交一致：组额度只在成功放行的请求上增加。
+                    working_used[group_id] += preview.risk_occupancy
+                preview = replace(
+                    preview, group_used_after=working_used[group_id]
+                )
+            results.append(preview)
+            balance = preview.validated_available_balance
+
+        return RiskGroupBatchPreviewResult(
+            results=tuple(results),
+            validated_available_balance=balance,
+            risk_groups=MappingProxyType(
+                {
+                    group_id: RiskGroupUsage(
+                        used=working_used[group_id],
+                        limit=limit,
+                        remaining=limit - working_used[group_id],
+                    )
+                    for group_id, limit in working_limits.items()
+                }
+            ),
+        )
+
     def process_multicurrency_batch(
         self,
         opening_pool_balances: Mapping[str, Number],
@@ -589,6 +676,49 @@ class ClearingEngine:
         return MulticurrencyBatchResult(
             results=tuple(results),
             event_ids=tuple(result.event_id for result in results),
+            validated_available_balances=MappingProxyType(working),
+        )
+
+    def preview_multicurrency_batch(
+        self,
+        opening_pool_balances: Mapping[str, Number],
+        requests: Iterable[Mapping[str, object]],
+    ) -> MulticurrencyBatchPreviewResult:
+        """对多币种批次做提交前只读预演，返回不可变
+        :class:`MulticurrencyBatchPreviewResult`。
+
+        输入、债权格式、校验顺序与异常类型沿用
+        :meth:`process_multicurrency_batch`（空批次、期初映射 / 数值错误、
+        缺币种、单笔债权混合币种、流水号重复、空债权清单、风险系数越界），
+        异常不留任何状态。
+
+        各币种余额在工作副本上独立滚动：每笔只动用自身币种余额，放行按
+        池内实际分配扣款，拒绝不动本币种余额；不换汇、不使用汇率，各币种
+        互不影响。预演不生成审计事件、不占流水号、不改余额、结果索引、
+        坏账台账与审计核对，重复或交叉调用幂等。
+
+        返回与 ``requests`` 同序的 :class:`SettlementPreview`（每笔的
+        ``validated_available_balance`` 为本币种预演执行后的即时余额）与
+        覆盖全部期初币种的最终余额映射，未使用币种保留期初原值。以相同
+        输入随后调用 :meth:`process_multicurrency_batch`，逐笔状态、拒绝
+        原因、各笔余额与各币种最终余额除新增 ``event_id`` 外一致。
+        """
+        balances, normalized = self._validate_multicurrency_batch(
+            opening_pool_balances, requests
+        )
+
+        results: list[SettlementPreview] = []
+        working = dict(balances)
+        for request in normalized:
+            request = replace(
+                request, pool_balance=working[request.currency]
+            )
+            preview = self._adjudicate(request)
+            results.append(preview)
+            working[request.currency] = preview.validated_available_balance
+
+        return MulticurrencyBatchPreviewResult(
+            results=tuple(results),
             validated_available_balances=MappingProxyType(working),
         )
 
@@ -702,11 +832,19 @@ class ClearingEngine:
         self._append_audit(request, result)
         return result
 
-    def _adjudicate(self, request: SettlementRequest) -> SettlementPreview:
+    def _adjudicate(
+        self,
+        request: SettlementRequest,
+        *,
+        group_used: Mapping[str, Decimal] | None = None,
+        group_limits: Mapping[str, Decimal] | None = None,
+    ) -> SettlementPreview:
         """纯计算限额校验与清算瀑布，返回预演结果。
 
         只读风险组状态（不增加已用额度），不触碰事件、序号、流水号、
-        结果索引与坏账台账；拒绝时余额不变、无任何分配。
+        结果索引与坏账台账；拒绝时余额不变、无任何分配。风险组预演传入
+        ``group_used`` / ``group_limits`` 工作副本以模拟批内累计，缺省
+        （None）时读取引擎已登记状态。
         """
         risk_occupancy = (
             request.settlement_amount
@@ -721,14 +859,22 @@ class ClearingEngine:
             return self._build_rejected(
                 request, risk_occupancy, "RISK_OCCUPANCY_EXCEEDS_BASE_LIMIT"
             )
-        if (
-            group_id is not None
-            and self._risk_group_used[group_id] + risk_occupancy
-            > self._risk_group_limits[group_id]
-        ):
-            return self._build_rejected(
-                request, risk_occupancy, "GROUP_LIMIT_EXCEEDED"
+        if group_id is not None:
+            used_table = (
+                self._risk_group_used if group_used is None else group_used
             )
+            limit_table = (
+                self._risk_group_limits
+                if group_limits is None
+                else group_limits
+            )
+            if (
+                used_table[group_id] + risk_occupancy
+                > limit_table[group_id]
+            ):
+                return self._build_rejected(
+                    request, risk_occupancy, "GROUP_LIMIT_EXCEEDED"
+                )
         return self._settle(request, risk_occupancy)
 
     def _to_result(
