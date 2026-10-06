@@ -302,6 +302,36 @@ recovery = engine.process_recovery("RC-001", "USD", Decimal("25"))
   按台账顺序返回该币种剩余明细（来源流水号、债权名、币种、余额），其他
   币种不受影响。
 
+## 坏账核销
+
+无法收回的存续坏账可以用
+`ClearingEngine.process_writeoff(writeoff_transaction_id, currency,
+writeoff_amount)` 核销结清（核销依赖台账状态，仅提供引擎方法）：
+
+```python
+writeoff = engine.process_writeoff("WO-001", "USD", Decimal("10"))
+```
+
+- 核销顺序与回收相同：先按存续坏账事件（审计事件）顺序、再按原始债权
+  清单顺序，只核销币种相符且仍有余额的明细；前项清零后处理后项，一笔
+  核销可部分覆盖单项坏账。
+- 核销**只减坏账**，不改变资金池余额、补充资本、风险组额度等其他状态；
+  历史 `SettlementResult` 不回写。
+- 返回不可变 `WriteoffResult`：核销流水号、币种、核销总额、按核销顺序
+  排列的 `WriteoffAllocation`（来源结算流水号、债权名、本次核销额、剩余
+  坏账）、核销后该币种存续坏账与事件标识。
+- 核销成功追加一条标识为
+  `EVT-{writeoff_transaction_id}-writeoff` 的审计事件（序号继续递增）：
+  `approved=True`、`validation_result="WRITEOFF"`、`risk_occupancy=0`，
+  `writeoff_allocations` 保存同额明细；结算 / 回收事件该字段恒为空元组，
+  `recovery_allocations` 不因核销变化。
+- 有坏账时零额核销合法，生成一条空明细事件；失败（流水号缺失 / 空、
+  重复流水号、缺币种、非法金额、无存续坏账、超额）不生成事件、不占
+  流水号、不改状态。
+- 只读查询不触发清算：`engine.writeoff_of(writeoff_transaction_id)`
+  返回 `WriteoffResult` 或 `None`。核销与回收都只冲减存续坏账台账，
+  先后衔接：核销从回收后的剩余余额继续。
+
 ## 返回结构
 
 成功与拒绝路径使用同构的 `SettlementResult`：
@@ -333,6 +363,8 @@ recovery = engine.process_recovery("RC-001", "USD", Decimal("25"))
 | 空批次请求清单 | `vault_guard.EmptyBatchError` |
 | 回收币种无存续坏账（含此时零额回收） | `vault_guard.NoOutstandingBadDebtError` |
 | 回收额超过该币种存续坏账 | `vault_guard.RecoveryAmountExceedsOutstandingError` |
+| 核销币种无存续坏账（含此时零额核销） | `vault_guard.NoOutstandingBadDebtError` |
+| 核销额超过该币种存续坏账 | `vault_guard.WriteoffAmountExceedsOutstandingError` |
 
 校验异常不产生任何半成品分配，也不写入审计台账；失败请求的流水号不被占用，
 可在修正后用同一流水号重新提交。
@@ -345,6 +377,7 @@ recovery = engine.process_recovery("RC-001", "USD", Decimal("25"))
 - 只读查询不触发清算：`engine.audit_log`（快照）、`engine.events()`、
   `engine.get_event(transaction_id)`、`engine.result_of(transaction_id)`、
   `engine.recovery_of(recovery_transaction_id)`、
+  `engine.writeoff_of(writeoff_transaction_id)`、
   `engine.outstanding_bad_debts(currency)`、
   `engine.audit_reconciliation(currency)`、
   `engine.has_transaction(transaction_id)`。
@@ -362,20 +395,24 @@ recovery = engine.process_recovery("RC-001", "USD", Decimal("25"))
 | `approved_count` | 放行结算事件数 |
 | `rejected_count` | 拒绝结算事件数 |
 | `recovery_count` | 回收事件数（含空明细的零额回收） |
+| `writeoff_count` | 核销事件数（含空明细的零额核销） |
 | `approved_risk_occupancy` | 仅放行请求的风险占用合计 |
 | `pool_allocated` | 放行请求池内分配按明细求和 |
 | `capital_allocated` | 放行请求补充资本按明细求和 |
 | `initial_bad_debt` | 放行时确认的首次坏账合计（未覆盖坏账） |
-| `recovered_amount` | 各回收事件冲减额按明细求和 |
+| `recovered_amount` | 各回收事件冲减额按明细求和（只计回收，不含核销） |
+| `written_off_amount` | 各核销事件核销额按明细求和 |
 | `outstanding_bad_debt` | `outstanding_bad_debts(currency)` 余额合计 |
 | `rejection_counts` | 按原因码排序的不可变原因次数映射，省略零次原因 |
-| `event_ids` | 该币种全部事件标识，保持台账顺序（结算与回收） |
+| `event_ids` | 该币种全部事件标识，保持台账顺序（结算、回收与核销） |
 
-核对恒等式：`initial_bad_debt - recovered_amount == outstanding_bad_debt`，
-且 `settlement_count == approved_count + rejected_count`。
+核对恒等式：
+`initial_bad_debt - recovered_amount - written_off_amount ==
+outstanding_bad_debt`，且
+`settlement_count == approved_count + rejected_count`。
 
-- 查询只读：重复调用不改变审计序号、事件、结果索引、风险组额度、坏账与
-  回收状态。
+- 查询只读：重复调用不改变审计序号、事件、结果索引、风险组额度、坏账、
+  回收与核销状态。
 - `currency` 非字符串或去首尾空白后为空抛 `InvalidCurrencyError`；匹配时
   去除首尾空白；台账中未出现的币种除 `currency` 外全为零，
   `rejection_counts` 与 `event_ids` 为空序列，空台账结果确定。

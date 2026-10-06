@@ -18,6 +18,8 @@
   批次入口（不换汇、不使用汇率）；
 - :meth:`ClearingEngine.process_recovery`：存续坏账回收入口（回收依赖台账
   状态，仅提供引擎方法，无模块级一次性入口）；
+- :meth:`ClearingEngine.process_writeoff`：坏账核销入口，把无法收回的存续
+  坏账结清（只减坏账，不改其他状态；仅提供引擎方法，无模块级一次性入口）；
 - :meth:`ClearingEngine.process_batch_retry` /
   :meth:`ClearingEngine.process_risk_group_batch_retry` /
   :meth:`ClearingEngine.process_multicurrency_batch_retry`：已进入清算处理
@@ -46,6 +48,7 @@ from .errors import (
     NoOutstandingBadDebtError,
     RecoveryAmountExceedsOutstandingError,
     VaultGuardError,
+    WriteoffAmountExceedsOutstandingError,
 )
 from .models import (
     AuditEvent,
@@ -72,6 +75,8 @@ from .models import (
     SettlementPreview,
     SettlementRequest,
     SettlementResult,
+    WriteoffAllocation,
+    WriteoffResult,
 )
 
 __all__ = [
@@ -92,6 +97,8 @@ __all__ = [
     "MulticurrencyBatchPreviewResult",
     "RecoveryAllocation",
     "RecoveryResult",
+    "WriteoffAllocation",
+    "WriteoffResult",
     "OutstandingBadDebt",
     "Creditor",
     "CreditorAttribution",
@@ -114,6 +121,7 @@ __all__ = [
     "InvalidRiskGroupError",
     "NoOutstandingBadDebtError",
     "RecoveryAmountExceedsOutstandingError",
+    "WriteoffAmountExceedsOutstandingError",
 ]
 
 __version__ = "0.1.0"

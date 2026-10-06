@@ -261,6 +261,67 @@ class AuditReconciliationTests(unittest.TestCase):
             summary.outstanding_bad_debt,
         )
 
+    def test_writeoff_counts_and_identity(self):
+        engine = make_engine_with_mixed_events()
+        # RC1 已回收 25（b 清零 20，c 剩 10）；再核销 c 的 6 与 4。
+        engine.process_writeoff("W1", "USD", D("6"))
+        zero = engine.process_writeoff("W0", "USD", D("0"))
+        self.assertEqual(zero.allocations, ())
+        engine.process_writeoff("W2", "USD", D("4"))
+        summary = engine.audit_reconciliation("USD")
+        self.assertEqual(summary.writeoff_count, 3)
+        self.assertEqual(summary.written_off_amount, D("10"))
+        # recovered_amount 只计回收，不含核销。
+        self.assertEqual(summary.recovered_amount, D("25"))
+        self.assertEqual(summary.recovery_count, 1)
+        self.assertEqual(summary.outstanding_bad_debt, D("0"))
+        self.assertEqual(
+            summary.initial_bad_debt
+            - summary.recovered_amount
+            - summary.written_off_amount,
+            summary.outstanding_bad_debt,
+        )
+        self.assertEqual(
+            summary.event_ids,
+            (
+                "EVT-T1-approved",
+                "EVT-T2-approved",
+                "EVT-R1-rejected",
+                "EVT-R2-rejected",
+                "EVT-RC1-recovery",
+                "EVT-W1-writeoff",
+                "EVT-W0-writeoff",
+                "EVT-W2-writeoff",
+            ),
+        )
+
+    def test_zero_writeoff_counted_without_amount(self):
+        engine = ClearingEngine()
+        engine.process(
+            "T1", "USD", D("100"), D("0"), D("0"), D("0"), D("0"),
+            [("a", D("10"))],
+        )
+        engine.process_writeoff("Z1", "USD", D("0"))
+        summary = engine.audit_reconciliation("USD")
+        self.assertEqual(summary.writeoff_count, 1)
+        self.assertEqual(summary.written_off_amount, D("0"))
+        self.assertEqual(summary.event_ids[-1], "EVT-Z1-writeoff")
+        self.assertEqual(
+            summary.initial_bad_debt
+            - summary.recovered_amount
+            - summary.written_off_amount,
+            summary.outstanding_bad_debt,
+        )
+
+    def test_writeoff_does_not_change_recovered_amount(self):
+        engine = make_engine_with_mixed_events()
+        before = engine.audit_reconciliation("USD")
+        engine.process_writeoff("W1", "USD", D("10"))
+        after = engine.audit_reconciliation("USD")
+        self.assertEqual(after.recovered_amount, before.recovered_amount)
+        self.assertEqual(after.recovery_count, before.recovery_count)
+        self.assertEqual(after.written_off_amount, D("10"))
+
     def test_query_is_read_only_and_idempotent(self):
         engine = make_engine_with_mixed_events()
         events_before = engine.events()
@@ -300,11 +361,13 @@ class AuditReconciliationTests(unittest.TestCase):
                 "approved_count",
                 "rejected_count",
                 "recovery_count",
+                "writeoff_count",
                 "approved_risk_occupancy",
                 "pool_allocated",
                 "capital_allocated",
                 "initial_bad_debt",
                 "recovered_amount",
+                "written_off_amount",
                 "outstanding_bad_debt",
                 "rejection_counts",
                 "event_ids",

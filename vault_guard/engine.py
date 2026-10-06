@@ -52,6 +52,15 @@
 ``recovery_allocations`` 保存同额明细），失败不生成事件、不占流水号、
 不改状态。
 
+坏账核销（:meth:`ClearingEngine.process_writeoff`）把无法收回的存续坏账
+结清：按审计事件顺序、再按原始债权顺序逐项核销币种相符且仍有坏账的债权，
+前项清零后处理后项，一笔核销可部分覆盖；核销只减坏账，不改变资金池、补充
+资本、风险组等其他状态，历史 :class:`SettlementResult` 不回写。核销成功
+追加一条标识为 ``EVT-{writeoff_transaction_id}-writeoff`` 的审计事件
+（序号继续递增，``writeoff_allocations`` 保存同额明细；
+``recovery_allocations`` 不变，结算 / 回收事件该字段为空），失败不生成
+事件、不占流水号、不改状态。
+
 批次重试与断点恢复（:meth:`ClearingEngine.process_batch_retry` /
 :meth:`ClearingEngine.process_risk_group_batch_retry` /
 :meth:`ClearingEngine.process_multicurrency_batch_retry`）在既有三类批次
@@ -88,6 +97,7 @@ from .errors import (
     MixedCurrencyError,
     NoOutstandingBadDebtError,
     RecoveryAmountExceedsOutstandingError,
+    WriteoffAmountExceedsOutstandingError,
 )
 from .models import (
     AuditEvent,
@@ -112,6 +122,8 @@ from .models import (
     SettlementPreview,
     SettlementRequest,
     SettlementResult,
+    WriteoffAllocation,
+    WriteoffResult,
 )
 
 __all__ = [
@@ -293,9 +305,10 @@ class ClearingEngine:
 
     审计台账为实例内内存中的追加式序列（``self.audit_log``），只读查询
     （:meth:`get_event` / :meth:`events` / :meth:`result_of` /
-    :meth:`recovery_of` / :meth:`outstanding_bad_debts` /
-    :meth:`audit_reconciliation`）不触发清算。
-    """
+    :meth:`recovery_of` / :meth:`writeoff_of` /
+    :meth:`outstanding_bad_debts` / :meth:`audit_reconciliation`）不触发
+    清算。
+"""
 
     def __init__(self) -> None:
         self._seen_transactions: set[str] = set()
@@ -305,9 +318,10 @@ class ClearingEngine:
         # 风险组登记上限与累计已用额度，跨批次保留。
         self._risk_group_limits: dict[str, Decimal] = {}
         self._risk_group_used: dict[str, Decimal] = {}
-        # 存续坏账台账（按事件顺序追加）与已登记回收结果。
+        # 存续坏账台账（按事件顺序追加）与已登记回收 / 核销结果。
         self._bad_debt_ledger: list[_BadDebtEntry] = []
         self._recoveries: dict[str, RecoveryResult] = {}
+        self._writeoffs: dict[str, WriteoffResult] = {}
         # 批次重试与断点恢复：稳定批次标识 -> 执行记录；注册表锁保护
         # 登记 / 冲突判定，每批次各自的锁串行并发提交。
         self._batch_runs: dict[str, _BatchRun] = {}
@@ -341,6 +355,10 @@ class ClearingEngine:
         """按回收流水号读取已有回收结果；不存在返回 None，不触发清算。"""
         return self._recoveries.get(recovery_transaction_id)
 
+    def writeoff_of(self, writeoff_transaction_id: str) -> WriteoffResult | None:
+        """按核销流水号读取已有核销结果；不存在返回 None，不触发清算。"""
+        return self._writeoffs.get(writeoff_transaction_id)
+
     def outstanding_bad_debts(self, currency: str) -> tuple[OutstandingBadDebt, ...]:
         """按台账顺序返回该币种仍有余额的存续坏账明细；不触发清算。
 
@@ -369,15 +387,17 @@ class ClearingEngine:
 
         按审计顺序（台账追加顺序）统计该币种事件：结算事件计入
         ``settlement_count`` 并分别汇总放行 / 拒绝；回收事件计入
-        ``recovery_count``。风险占用仅累计放行请求；池内分配、补充资本、
-        首次坏账与回收冲减均按事件内明细求和。``outstanding_bad_debt``
-        取 :meth:`outstanding_bad_debts` 余额合计，恒满足
-        ``initial_bad_debt - recovered_amount == outstanding_bad_debt``。
-        ``rejection_counts`` 为按原因码排序的只读映射，省略零次原因；
-        ``event_ids`` 保持台账顺序。
+        ``recovery_count`` 且 ``recovered_amount`` 只计回收冲减；核销事件
+        计入 ``writeoff_count`` 与 ``written_off_amount``。风险占用仅累计
+        放行请求；池内分配、补充资本、首次坏账、回收冲减与核销均按事件内
+        明细求和。``outstanding_bad_debt`` 取 :meth:`outstanding_bad_debts`
+        余额合计，恒满足
+        ``initial_bad_debt - recovered_amount - written_off_amount
+        == outstanding_bad_debt``。``rejection_counts`` 为按原因码排序的
+        只读映射，省略零次原因；``event_ids`` 保持台账顺序。
 
         查询只读：重复调用不改变审计序号、事件、结果索引、风险组额度、
-        坏账与回收状态。``currency`` 非字符串或去首尾空白后为空抛
+        坏账、回收与核销状态。``currency`` 非字符串或去首尾空白后为空抛
         :class:`InvalidCurrencyError`；匹配时去除首尾空白；未出现的币种
         除 ``currency`` 外全部为零、两序列为空。
         """
@@ -389,11 +409,13 @@ class ClearingEngine:
         approved_count = 0
         rejected_count = 0
         recovery_count = 0
+        writeoff_count = 0
         approved_risk_occupancy = _ZERO
         pool_allocated = _ZERO
         capital_allocated = _ZERO
         initial_bad_debt = _ZERO
         recovered_amount = _ZERO
+        written_off_amount = _ZERO
         rejection_counts: dict[str, int] = {}
         event_ids: list[str] = []
 
@@ -405,6 +427,13 @@ class ClearingEngine:
                 recovery_count += 1
                 recovered_amount += sum(
                     (allocation[2] for allocation in event.recovery_allocations),
+                    _ZERO,
+                )
+                continue
+            if event.validation_result == "WRITEOFF":
+                writeoff_count += 1
+                written_off_amount += sum(
+                    (allocation[2] for allocation in event.writeoff_allocations),
                     _ZERO,
                 )
                 continue
@@ -439,11 +468,13 @@ class ClearingEngine:
             approved_count=approved_count,
             rejected_count=rejected_count,
             recovery_count=recovery_count,
+            writeoff_count=writeoff_count,
             approved_risk_occupancy=approved_risk_occupancy,
             pool_allocated=pool_allocated,
             capital_allocated=capital_allocated,
             initial_bad_debt=initial_bad_debt,
             recovered_amount=recovered_amount,
+            written_off_amount=written_off_amount,
             outstanding_bad_debt=outstanding_bad_debt,
             rejection_counts=MappingProxyType(
                 dict(sorted(rejection_counts.items()))
@@ -1299,6 +1330,104 @@ class ClearingEngine:
         self._recoveries[recovery_transaction_id] = result
         return result
 
+    def process_writeoff(
+        self,
+        writeoff_transaction_id: str,
+        currency: str,
+        writeoff_amount: Number,
+    ) -> WriteoffResult:
+        """提交一笔坏账核销，把无法收回的存续坏账结清，返回不可变
+        :class:`WriteoffResult`。
+
+        只核销已放行结算留下的未覆盖债权：按审计事件顺序、再按原始债权
+        清单顺序逐项核销币种相符且仍有坏账的债权，前项清零后处理后项，
+        一笔核销可部分覆盖单项坏账。核销只减坏账，不改变资金池、补充资本、
+        风险组额度等其他状态，历史 :class:`SettlementResult` 不回写。
+
+        - 流水号缺失 / 为空抛内建 :class:`ValueError`；
+        - 重复核销流水号（含与结算 / 回收流水号冲突）抛
+          :class:`DuplicateTransactionError`；
+        - 缺币种抛 :class:`InvalidCurrencyError`；
+        - 负数、NaN、无穷或非数值核销额抛内建 :class:`ValueError`；
+        - 该币种无存续坏账（含此时零额核销）抛
+          :class:`NoOutstandingBadDebtError`；
+        - 核销额超过该币种存续坏账总额抛
+          :class:`WriteoffAmountExceedsOutstandingError`。
+
+        失败不生成事件、不占流水号、不改状态。有坏账时零额核销合法，生成
+        一条空明细事件，标识为 ``EVT-{writeoff_transaction_id}-writeoff``，
+        审计序号继续递增。
+        """
+        if not isinstance(writeoff_transaction_id, str) or not writeoff_transaction_id.strip():
+            raise ValueError("writeoff_transaction_id 必须是非空字符串")
+
+        # 重复流水号：在任何归一化/状态变更之前判定。
+        if writeoff_transaction_id in self._seen_transactions:
+            raise DuplicateTransactionError(
+                f"重复的业务流水号: {writeoff_transaction_id}"
+            )
+
+        if not isinstance(currency, str) or not currency.strip():
+            raise InvalidCurrencyError("账户币种缺失或为空")
+        currency = currency.strip()
+
+        amount = _as_decimal(writeoff_amount, "writeoff_amount")
+        _check_non_negative(amount, "writeoff_amount")
+
+        outstanding_total = sum(
+            (
+                entry.remaining
+                for entry in self._bad_debt_ledger
+                if entry.currency == currency
+            ),
+            _ZERO,
+        )
+        if outstanding_total <= _ZERO:
+            raise NoOutstandingBadDebtError(
+                f"币种 {currency} 无存续坏账可核销"
+            )
+        if amount > outstanding_total:
+            raise WriteoffAmountExceedsOutstandingError(
+                f"核销额 {amount} 超过币种 {currency} 存续坏账 {outstanding_total}"
+            )
+
+        # 校验全部通过后才登记流水号并执行核销。
+        self._seen_transactions.add(writeoff_transaction_id)
+
+        remaining = amount
+        allocations: list[WriteoffAllocation] = []
+        for entry in self._bad_debt_ledger:
+            if remaining <= _ZERO:
+                break
+            if entry.currency != currency or entry.remaining <= _ZERO:
+                continue
+            write_down = min(entry.remaining, remaining)
+            entry.remaining -= write_down
+            remaining -= write_down
+            allocations.append(
+                WriteoffAllocation(
+                    source_transaction_id=entry.source_transaction_id,
+                    creditor=entry.creditor,
+                    written_off_amount=write_down,
+                    remaining_bad_debt=entry.remaining,
+                )
+            )
+
+        outstanding_after = outstanding_total - amount
+        event_id = f"EVT-{writeoff_transaction_id}-writeoff"
+        result = WriteoffResult(
+            writeoff_transaction_id=writeoff_transaction_id,
+            currency=currency,
+            writeoff_amount=amount,
+            allocations=tuple(allocations),
+            total_written_off=amount - remaining,
+            outstanding_bad_debt=outstanding_after,
+            event_id=event_id,
+        )
+        self._append_writeoff_audit(result)
+        self._writeoffs[writeoff_transaction_id] = result
+        return result
+
     def _execute(self, request: SettlementRequest) -> SettlementResult:
         """对已校验请求执行限额校验、清算与审计追加。"""
         preview = self._adjudicate(request)
@@ -2123,6 +2252,39 @@ class ClearingEngine:
                     allocation.source_transaction_id,
                     allocation.creditor,
                     allocation.recovered_amount,
+                    allocation.remaining_bad_debt,
+                )
+                for allocation in result.allocations
+            ),
+        )
+        self._events.append(event)
+
+    def _append_writeoff_audit(self, result: WriteoffResult) -> None:
+        """为核销结果追加一条审计事件；结算 / 回收专属字段按核销语义置空。"""
+        self._sequence += 1
+        event = AuditEvent(
+            event_id=result.event_id,
+            sequence=self._sequence,
+            transaction_id=result.writeoff_transaction_id,
+            approved=True,
+            currency=result.currency,
+            input_summary={
+                "writeoff_transaction_id": result.writeoff_transaction_id,
+                "currency": result.currency,
+                "writeoff_amount": result.writeoff_amount,
+            },
+            validation_result="WRITEOFF",
+            risk_occupancy=_ZERO,
+            pool_allocations=(),
+            capital_allocations=(),
+            uncovered_bad_debt=result.outstanding_bad_debt,
+            validated_available_balance=_ZERO,
+            rejection_reason=None,
+            writeoff_allocations=tuple(
+                (
+                    allocation.source_transaction_id,
+                    allocation.creditor,
+                    allocation.written_off_amount,
                     allocation.remaining_bad_debt,
                 )
                 for allocation in result.allocations
