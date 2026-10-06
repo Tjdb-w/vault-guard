@@ -20,6 +20,10 @@
   状态，仅提供引擎方法，无模块级一次性入口）；
 - :meth:`ClearingEngine.process_writeoff`：存续坏账核销入口（核销依赖台账
   状态，仅提供引擎方法，无模块级一次性入口）；
+- :meth:`ClearingEngine.creditor_bad_debt_report`：债权人维度只读坏账
+  报告入口（按债权人合并多来源坏账，返回不可变
+  :class:`~vault_guard.models.CreditorBadDebtSummary` 元组，不新增事件、
+  不改任何状态）；
 - :meth:`ClearingEngine.process_batch_retry` /
   :meth:`ClearingEngine.process_risk_group_batch_retry` /
   :meth:`ClearingEngine.process_multicurrency_batch_retry`：已进入清算处理
@@ -63,6 +67,7 @@ from .models import (
     BATCH_OUTCOME_RETRY_CONFLICT,
     Creditor,
     CreditorAttribution,
+    CreditorBadDebtSummary,
     CurrencyAuditSummary,
     MulticurrencyBatchResult,
     MulticurrencyBatchPreviewResult,
@@ -102,6 +107,7 @@ __all__ = [
     "OutstandingBadDebt",
     "Creditor",
     "CreditorAttribution",
+    "CreditorBadDebtSummary",
     "CurrencyAuditSummary",
     "AuditEvent",
     "BatchRetryConflict",

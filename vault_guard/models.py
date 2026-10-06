@@ -6,7 +6,7 @@
 
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Mapping
+from typing import Mapping, NamedTuple
 
 __all__ = [
     "Creditor",
@@ -27,6 +27,7 @@ __all__ = [
     "WriteoffResult",
     "OutstandingBadDebt",
     "CurrencyAuditSummary",
+    "CreditorBadDebtSummary",
     "AuditEvent",
     "BatchRetryConflict",
     "BatchIdentifierInvalid",
@@ -392,6 +393,37 @@ class CurrencyAuditSummary:
     outstanding_bad_debt: Decimal
     rejection_counts: Mapping[str, int]
     event_ids: tuple[str, ...]
+
+
+class CreditorBadDebtSummary(NamedTuple):
+    """单个债权人维度的坏账汇总（不可变，只读查询结果）。
+
+    合并同一债权人名下的多来源坏账记录，金额均为 :class:`Decimal`：
+
+    - ``creditor``：债权人名（与台账归因中的名称完全一致）。
+    - ``source_transaction_ids``：放行归因坏账大于零的来源结算流水号，按
+      审计事件顺序去重（同一流水号在多笔债权归因中只出现一次）。
+    - ``recovery_transaction_ids``：实际冲减到该债权人的回收流水号，按
+      审计事件顺序去重；空明细零额回收不归属任何债权人。
+    - ``writeoff_transaction_ids``：实际核销到该债权人的核销流水号，按
+      审计事件顺序去重；空明细零额核销不归属任何债权人。
+    - ``initial_bad_debt``：放行归因中该债权人名下大于零坏账的合计。
+    - ``recovered_amount``：现有回收分配中归属该债权人的冲减额合计。
+    - ``written_off_amount``：现有核销分配中归属该债权人的核销额合计。
+    - ``outstanding_bad_debt``：
+      ``initial_bad_debt - recovered_amount - written_off_amount``，
+      恒等于 :meth:`ClearingEngine.outstanding_bad_debts` 中该债权人的
+      来源余额合计；全额结清的债权人保留该行（该项为 0）。
+    """
+
+    creditor: str
+    source_transaction_ids: tuple[str, ...]
+    recovery_transaction_ids: tuple[str, ...]
+    writeoff_transaction_ids: tuple[str, ...]
+    initial_bad_debt: Decimal
+    recovered_amount: Decimal
+    written_off_amount: Decimal
+    outstanding_bad_debt: Decimal
 
 
 @dataclass(frozen=True)
