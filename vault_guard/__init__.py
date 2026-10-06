@@ -24,6 +24,9 @@
   报告入口（按债权人合并多来源坏账，返回不可变
   :class:`~vault_guard.models.CreditorBadDebtSummary` 元组，不新增事件、
   不改任何状态）；
+- :meth:`ClearingEngine.bad_debt_trail`：按来源结算流水号串联坏账处理
+  记录的只读轨迹入口（精确匹配已登记结算流水号，返回不可变
+  :class:`~vault_guard.models.BadDebtTrail`，不新增事件、不改任何状态）；
 - :meth:`ClearingEngine.process_batch_retry` /
   :meth:`ClearingEngine.process_risk_group_batch_retry` /
   :meth:`ClearingEngine.process_multicurrency_batch_retry`：已进入清算处理
@@ -56,6 +59,8 @@ from .errors import (
 )
 from .models import (
     AuditEvent,
+    BadDebtOperation,
+    BadDebtTrail,
     BatchIdentifierInvalid,
     BatchPreviewResult,
     BatchRetryConflict,
@@ -108,6 +113,8 @@ __all__ = [
     "Creditor",
     "CreditorAttribution",
     "CreditorBadDebtSummary",
+    "BadDebtOperation",
+    "BadDebtTrail",
     "CurrencyAuditSummary",
     "AuditEvent",
     "BatchRetryConflict",

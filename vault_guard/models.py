@@ -28,6 +28,8 @@ __all__ = [
     "OutstandingBadDebt",
     "CurrencyAuditSummary",
     "CreditorBadDebtSummary",
+    "BadDebtOperation",
+    "BadDebtTrail",
     "AuditEvent",
     "BatchRetryConflict",
     "BatchIdentifierInvalid",
@@ -424,6 +426,50 @@ class CreditorBadDebtSummary(NamedTuple):
     recovered_amount: Decimal
     written_off_amount: Decimal
     outstanding_bad_debt: Decimal
+
+
+class BadDebtOperation(NamedTuple):
+    """坏账轨迹上的一条回收或核销操作（不可变，只读查询结果）。
+
+    仅收录明细中来源结算流水号命中的记录；同一债权多次部分处理不合并、
+    不覆盖，每条单独保留：
+
+    - ``operation_id``：回收或核销自身的业务流水号。
+    - ``creditor``：被冲减 / 核销的债权名。
+    - ``amount``：本次操作对该债权的回收或核销金额。
+    - ``remaining``：该债权在本次操作处理后的坏账余额。
+    """
+
+    operation_id: str
+    creditor: str
+    amount: Decimal
+    remaining: Decimal
+
+
+class BadDebtTrail(NamedTuple):
+    """按来源结算流水号串联的坏账处理只读轨迹（不可变）。
+
+    - ``transaction_id``：命中的已登记来源结算流水号（精确匹配）。
+    - ``initial_bad_debt``：该来源结算放行时确认的首次坏账，即原结算的
+      ``uncovered_bad_debt``；拒绝或未形成坏账的放行结算为 0。
+    - ``recovered_amount``：命中该来源的全部回收明细金额之和。
+    - ``written_off_amount``：命中该来源的全部核销明细金额之和。
+    - ``outstanding_bad_debt``：
+      ``initial_bad_debt - recovered_amount - written_off_amount``，
+      与 :meth:`ClearingEngine.outstanding_bad_debts` 中该来源的同来源
+      余额合计一致。
+    - ``recoveries`` / ``writeoffs``：按审计顺序、再按事件内明细顺序
+      排列的 :class:`BadDebtOperation` 元组，只保留来源命中的记录；
+      拒绝结算或未形成坏账时均为空元组。
+    """
+
+    transaction_id: str
+    initial_bad_debt: Decimal
+    recovered_amount: Decimal
+    written_off_amount: Decimal
+    outstanding_bad_debt: Decimal
+    recoveries: tuple[BadDebtOperation, ...]
+    writeoffs: tuple[BadDebtOperation, ...]
 
 
 @dataclass(frozen=True)

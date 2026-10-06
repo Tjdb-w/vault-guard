@@ -69,6 +69,15 @@ outstanding_bad_debt``（与 :meth:`outstanding_bad_debts` 该债权人余额
 合计一致），空明细零额回收 / 核销不归属债权人。可传债权人名单过滤，
 未命中不报错；查询不新增事件、不改任何状态。
 
+按来源结算流水号串联的坏账处理轨迹（:meth:`ClearingEngine.bad_debt_trail`）
+是只读查询：只接受已登记结算流水号并精确匹配（不去首尾空白），拒绝结算与
+未形成坏账的放行结算命中零额空明细轨迹，回收 / 核销流水号不作替代查询、
+未命中返回 ``None``；返回不可变 :class:`BadDebtTrail`，首次坏账取原结算的
+``uncovered_bad_debt``，回收 / 核销按命中明细求和并按审计顺序、事件内
+顺序给出 :class:`BadDebtOperation`，存续额等于首次坏账减两项且与
+:meth:`outstanding_bad_debts` 同来源余额合计一致。查询不新增事件、不占
+流水号、不改任何状态。
+
 批次重试与断点恢复（:meth:`ClearingEngine.process_batch_retry` /
 :meth:`ClearingEngine.process_risk_group_batch_retry` /
 :meth:`ClearingEngine.process_multicurrency_batch_retry`）在既有三类批次
@@ -109,6 +118,8 @@ from .errors import (
 )
 from .models import (
     AuditEvent,
+    BadDebtOperation,
+    BadDebtTrail,
     BatchIdentifierInvalid,
     BatchPreviewResult,
     BatchRetryConflict,
@@ -348,7 +359,7 @@ class ClearingEngine:
     （:meth:`get_event` / :meth:`events` / :meth:`result_of` /
     :meth:`recovery_of` / :meth:`writeoff_of` /
     :meth:`outstanding_bad_debts` / :meth:`audit_reconciliation` /
-    :meth:`creditor_bad_debt_report`）不触发清算。
+    :meth:`creditor_bad_debt_report` / :meth:`bad_debt_trail`）不触发清算。
     """
 
     def __init__(self) -> None:
@@ -655,6 +666,94 @@ class ClearingEngine:
                 )
             )
         return tuple(rows)
+
+    def bad_debt_trail(self, transaction_id: str) -> BadDebtTrail | None:
+        """按来源结算流水号串联坏账处理记录，返回只读
+        :class:`BadDebtTrail`；未命中返回 ``None``。
+
+        只接受**已登记结算流水号**（精确匹配，不去除首尾空白）：拒绝结算
+        与未形成坏账的放行结算同样命中，返回零额、空明细轨迹。回收 / 核销
+        流水号不是来源结算流水号，不作替代查询（不回退按操作流水号检索），
+        一律按未命中处理返回 ``None``；台账中从不存在的流水号同样返回
+        ``None``。
+
+        - ``initial_bad_debt`` 取原结算结果的 ``uncovered_bad_debt``：
+          拒绝结算与全额受偿的放行结算均为 0。
+        - ``recoveries`` / ``writeoffs`` 只保留明细中来源结算流水号命中
+          的记录，按审计事件顺序、再按事件内明细顺序排列，每条
+          :class:`BadDebtOperation` 给出操作流水号 ``operation_id``、
+          ``creditor``、本次 ``amount`` 与该债权处理后的余额
+          ``remaining``；同一债权多次部分处理不合并、不覆盖。
+        - ``recovered_amount`` / ``written_off_amount`` 按命中明细求和；
+          ``outstanding_bad_debt`` 恒等于
+          ``initial_bad_debt - recovered_amount - written_off_amount``，
+          且与 :meth:`outstanding_bad_debts` 中该来源的同来源余额合计
+          一致。空明细的零额回收 / 核销事件不产生轨迹明细。
+
+        ``transaction_id`` 不是字符串或去首尾空白后为空时抛内建
+        :class:`ValueError`。查询只读且结果确定：不生成事件、不占流水号、
+        不改台账、结果索引、风险组额度、资金池或坏账状态，不落盘、不换汇、
+        不估时；空台账与重复查询结果稳定一致。
+        """
+        if not isinstance(transaction_id, str) or not transaction_id.strip():
+            raise ValueError("transaction_id 必须是非空字符串")
+
+        # 已登记结算结果索引精确标识来源结算；回收 / 核销流水号不在其中，
+        # 不作替代查询，直接按未命中处理。
+        result = self._results.get(transaction_id)
+        if result is None:
+            return None
+
+        recoveries: list[BadDebtOperation] = []
+        writeoffs: list[BadDebtOperation] = []
+        recovered_amount = _ZERO
+        written_off_amount = _ZERO
+
+        for event in self._events:
+            if event.validation_result == "RECOVERY":
+                for source_id, creditor, amount, remaining in (
+                    event.recovery_allocations
+                ):
+                    if source_id != transaction_id:
+                        continue
+                    recoveries.append(
+                        BadDebtOperation(
+                            operation_id=event.transaction_id,
+                            creditor=creditor,
+                            amount=amount,
+                            remaining=remaining,
+                        )
+                    )
+                    recovered_amount += amount
+                continue
+            if event.validation_result == "WRITEOFF":
+                for source_id, creditor, amount, remaining in (
+                    event.writeoff_allocations
+                ):
+                    if source_id != transaction_id:
+                        continue
+                    writeoffs.append(
+                        BadDebtOperation(
+                            operation_id=event.transaction_id,
+                            creditor=creditor,
+                            amount=amount,
+                            remaining=remaining,
+                        )
+                    )
+                    written_off_amount += amount
+
+        initial_bad_debt = result.uncovered_bad_debt
+        return BadDebtTrail(
+            transaction_id=transaction_id,
+            initial_bad_debt=initial_bad_debt,
+            recovered_amount=recovered_amount,
+            written_off_amount=written_off_amount,
+            outstanding_bad_debt=(
+                initial_bad_debt - recovered_amount - written_off_amount
+            ),
+            recoveries=tuple(recoveries),
+            writeoffs=tuple(writeoffs),
+        )
 
     # ------------------------------------------------------------------ #
     # 公开入口
