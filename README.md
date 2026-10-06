@@ -367,6 +367,51 @@ rows = engine.creditor_bad_debt_report("USD", ("alice", "bob"))
   `audit_log`、结果索引、风险组、资金池、坏账 / 回收 / 核销状态，不落盘、
   不换汇、不估时。空台账或该币种无坏账返回空元组。
 
+## 坏账处理轨迹
+
+`ClearingEngine.bad_debt_trail(transaction_id)` 按**来源结算流水号**串联
+一笔坏账从确认到回收 / 核销的完整处理轨迹，返回不可变 `BadDebtTrail`：
+
+```python
+trail = engine.bad_debt_trail("TX-001")   # 未命中返回 None
+```
+
+- **匹配口径**：只接受**已登记的结算流水号**（放行或拒绝），按已登记
+  流水号原值精确匹配（去首尾空白仅用于空值判定，登记本身不归一化流水号）；
+  参数不是字符串或去首尾空白后为空抛 `ValueError`。传入回收 / 核销流水号
+  **不作替代查询**，一律返回 `None`；流水号不存在、空台账同样返回 `None`。
+- **首次坏账**：`initial_bad_debt` 取原结算结果的 `uncovered_bad_debt`。
+  拒绝结算与未形成坏账（零未覆盖坏账）的放行结算返回零额、空明细的确定
+  轨迹。
+- **操作明细**：`recoveries` / `writeoffs` 为不可变 `BadDebtOperation`
+  序列，按审计事件顺序、再按事件内明细顺序，**仅保留来源流水号命中**的
+  记录；同一债权多次部分处理逐条保留，不合并、不覆盖。
+
+`BadDebtOperation` 字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `operation_id` | 回收 / 核销自身的业务流水号 |
+| `creditor` | 被冲减 / 核销的债权名 |
+| `amount` | 本次对该来源该债权坏账的冲减 / 核销额 |
+| `remaining` | 该债权本次操作处理后的坏账余额 |
+
+`BadDebtTrail` 字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `transaction_id` | 命中的已登记来源结算流水号（原值） |
+| `initial_bad_debt` | 原结算确认的首次坏账（未覆盖坏账） |
+| `recovered_amount` | 命中该来源的回收明细金额合计 |
+| `written_off_amount` | 命中该来源的核销明细金额合计 |
+| `outstanding_bad_debt` | 首次坏账减回收与核销，等于 `outstanding_bad_debts` 中该来源各债权余额合计 |
+| `recoveries` | 命中该来源的回收操作 `BadDebtOperation` 元组 |
+| `writeoffs` | 命中该来源的核销操作 `BadDebtOperation` 元组 |
+
+- **只读**：重复查询结果确定，不生成事件、不占审计序号或流水号、不改
+  台账、结果索引、风险组额度、资金池或坏账 / 回收 / 核销状态，不落盘、
+  不换汇、不估时。
+
 ## 返回结构
 
 成功与拒绝路径使用同构的 `SettlementResult`：
@@ -415,6 +460,7 @@ rows = engine.creditor_bad_debt_report("USD", ("alice", "bob"))
   `engine.outstanding_bad_debts(currency)`、
   `engine.audit_reconciliation(currency)`、
   `engine.creditor_bad_debt_report(currency, creditor_names=None)`、
+  `engine.bad_debt_trail(transaction_id)`、
   `engine.has_transaction(transaction_id)`。
 
 ### 单币种审计核对快照

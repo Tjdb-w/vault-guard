@@ -26,6 +26,8 @@ __all__ = [
     "WriteoffAllocation",
     "WriteoffResult",
     "OutstandingBadDebt",
+    "BadDebtOperation",
+    "BadDebtTrail",
     "CurrencyAuditSummary",
     "CreditorBadDebtSummary",
     "AuditEvent",
@@ -354,6 +356,51 @@ class OutstandingBadDebt:
     creditor: str
     currency: str
     balance: Decimal
+
+
+@dataclass(frozen=True)
+class BadDebtOperation:
+    """坏账轨迹中的一条回收或核销操作明细（不可变，只读查询结果）。
+
+    仅收录来源结算流水号命中的明细，按审计事件顺序、事件内明细顺序排列：
+
+    - ``operation_id``：回收或核销自身的业务流水号。
+    - ``creditor``：被冲减 / 核销的债权名。
+    - ``amount``：本次操作对该来源该债权坏账的冲减 / 核销额。
+    - ``remaining``：该债权在本次操作处理后的坏账余额。
+    """
+
+    operation_id: str
+    creditor: str
+    amount: Decimal
+    remaining: Decimal
+
+
+@dataclass(frozen=True)
+class BadDebtTrail:
+    """按来源结算流水号串联的坏账处理只读轨迹（不可变）。
+
+    - ``transaction_id``：命中的已登记来源结算流水号。
+    - ``initial_bad_debt``：该结算放行时确认的首次坏账（未覆盖坏账）。
+    - ``recovered_amount``：命中该来源的回收明细金额合计。
+    - ``written_off_amount``：命中该来源的核销明细金额合计。
+    - ``outstanding_bad_debt``：
+      ``initial_bad_debt - recovered_amount - written_off_amount``，
+      恒等于 :meth:`ClearingEngine.outstanding_bad_debts` 中该来源各债权
+      余额合计。
+    - ``recoveries``：命中该来源的回收操作明细
+      :class:`BadDebtOperation` 序列（按审计顺序与事件内顺序，不合并、
+      不覆盖）。
+    - ``writeoffs``：命中该来源的核销操作明细序列，口径同 ``recoveries``。
+    """
+
+    transaction_id: str
+    initial_bad_debt: Decimal
+    recovered_amount: Decimal
+    written_off_amount: Decimal
+    outstanding_bad_debt: Decimal
+    recoveries: tuple[BadDebtOperation, ...]
+    writeoffs: tuple[BadDebtOperation, ...]
 
 
 @dataclass(frozen=True)
