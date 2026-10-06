@@ -26,6 +26,13 @@ __all__ = [
     "OutstandingBadDebt",
     "CurrencyAuditSummary",
     "AuditEvent",
+    "BatchRetryConflict",
+    "BatchIdentifierInvalid",
+    "BATCH_OUTCOME_RETRY_CONFLICT",
+    "BATCH_OUTCOME_INVALID_IDENTIFIER",
+    "BATCH_INVALID_REASON_MISSING_BATCH_ID",
+    "BATCH_INVALID_REASON_MISSING_EXECUTION_ID",
+    "BATCH_INVALID_REASON_UNCOMPUTABLE_DIGEST",
 ]
 
 
@@ -369,3 +376,57 @@ class AuditEvent:
     # 回收事件的冲减明细：
     # (来源结算流水号, 债权名, 本次冲减额, 剩余坏账)；结算事件恒为空元组。
     recovery_allocations: tuple[tuple[str, str, Decimal, Decimal], ...] = ()
+
+
+# --------------------------------------------------------------------------- #
+# 批次重试与断点恢复
+# --------------------------------------------------------------------------- #
+
+# 相同批次标识配不同请求内容：在任何资金或审计副作用之前拒绝。
+BATCH_OUTCOME_RETRY_CONFLICT = "BATCH_RETRY_CONFLICT"
+# 批次标识 / 执行标识缺失、为空或请求摘要无法计算：在任何副作用之前拒绝。
+BATCH_OUTCOME_INVALID_IDENTIFIER = "BATCH_IDENTIFIER_INVALID"
+
+# BatchIdentifierInvalid.reason 的机器可读原因码。
+BATCH_INVALID_REASON_MISSING_BATCH_ID = "MISSING_BATCH_ID"
+BATCH_INVALID_REASON_MISSING_EXECUTION_ID = "MISSING_EXECUTION_ID"
+BATCH_INVALID_REASON_UNCOMPUTABLE_DIGEST = "UNCOMPUTABLE_REQUEST_DIGEST"
+
+
+@dataclass(frozen=True)
+class BatchRetryConflict:
+    """批次重试冲突的唯一拒绝结果（不可变）。
+
+    同一稳定批次标识此前已登记，但本次请求内容的确定性摘要与首次不同：
+    系统在产生任何资金或审计副作用之前拒绝本次执行。
+
+    - ``outcome``：固定为 :data:`BATCH_OUTCOME_RETRY_CONFLICT`。
+    - ``batch_id``：冲突批次的稳定标识。
+    - ``original_request_digest``：首次登记请求内容的摘要。
+    - ``incoming_request_digest``：本次请求内容的摘要。
+    - ``original_execution_id``：首次执行标识。
+    """
+
+    batch_id: str
+    original_request_digest: str
+    incoming_request_digest: str
+    original_execution_id: str
+    outcome: str = BATCH_OUTCOME_RETRY_CONFLICT
+
+
+@dataclass(frozen=True)
+class BatchIdentifierInvalid:
+    """批次标识无效的唯一拒绝结果（不可变）。
+
+    批次标识或执行标识缺失、为空（去首尾空白后），或请求摘要无法计算时，
+    系统在产生任何资金或审计副作用之前拒绝本次执行。
+
+    - ``outcome``：固定为 :data:`BATCH_IDENTIFIER_INVALID`。
+    - ``reason``：机器可读的无效原因码：``MISSING_BATCH_ID`` /
+      ``MISSING_EXECUTION_ID`` / ``UNCOMPUTABLE_REQUEST_DIGEST``。
+    - ``batch_id``：可观察到的批次标识；标识本身缺失或为空时为 ``None``。
+    """
+
+    reason: str
+    batch_id: str | None = None
+    outcome: str = BATCH_OUTCOME_INVALID_IDENTIFIER

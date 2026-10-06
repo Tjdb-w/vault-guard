@@ -196,6 +196,70 @@ batch = engine.process_multicurrency_batch(
 opening_pool_balances, requests)` 使用一次性引擎返回结果，不跨批次保留
 状态。
 
+## 批次重试与断点恢复
+
+已经进入清算处理的批次可以通过三个**可重试入口**提交，分别与三个正式
+批次入口一一对应（清算输入、金额精度、业务时间语义、滚动余额、限额命中
+口径、清偿顺序、坏账归属与审计记录完全沿用既有实现）：
+
+```python
+# 同币种批次，对应 process_batch
+batch = engine.process_batch_retry(
+    "BATCH-2026-001",       # 稳定批次标识：同一批次的首次与全部重试相同
+    "exec-0007",            # 本次执行标识：重试时可不同
+    "USD", Decimal("100"), requests,
+)
+
+# 风险组批次，对应 process_risk_group_batch
+batch = engine.process_risk_group_batch_retry(
+    "BATCH-2026-002", "exec-0001",
+    "USD", Decimal("100"), {"G1": Decimal("100")}, requests,
+)
+
+# 多币种批次，对应 process_multicurrency_batch
+batch = engine.process_multicurrency_batch_retry(
+    "BATCH-2026-003", "exec-0001",
+    {"USD": Decimal("100"), "EUR": Decimal("50")}, requests,
+)
+```
+
+- 系统先按 `batch_id` 检查该批次是否处理过，再按既有入口顺序完成整体
+  校验、逐笔限额校验、清算瀑布分配、坏账归因与审计记账。
+- **首次成功**返回原有批次结果（`BatchSettlementResult` /
+  `RiskGroupBatchResult` / `MulticurrencyBatchResult`），其内容与对应
+  既有正式入口逐字段一致。
+- **内容一致的重试**（相同 `batch_id` + 相同请求内容，无论
+  `execution_id` 是否相同）返回与首次**完全相同**的清算结果（同一结果
+  对象）和审计内容：不重复扣减、不重复归因、不重复追加审计记录，
+  `audit_log`、流水号占用、风险组额度、坏账台账与审计核对均不再变化。
+  金额按引擎既有归一化口径比较：`int` / `float` / `Decimal` 的等价金额
+  （如 `40` / `40.0` / `Decimal("40.00")`）视为相同内容。
+- **断点恢复**：处理中断后再次提交相同请求，从首个尚未完成的步骤继续；
+  已完成步骤不再次产生副作用（不出现两套金额分配或两条等价审计轨迹）。
+  单步执行意外失败时只回滚该步骤（事件、序号、流水号、该步风险组占用、
+  坏账台账），下一轮从同一请求重新执行。
+- **并发提交**：同一 `batch_id` 的并发请求只允许一个推进处理，其余请求
+  等待并取得同一最终结果；不同批次互不阻塞。
+
+重试入口在以下两种情况下**在产生任何资金或审计副作用之前**拒绝，返回
+唯一的拒绝结果（不抛异常、不登记批次、不写入台账），且不与既有失败 /
+部分成功 / 金额不足等业务结果混用：
+
+| 结果 | `outcome` 常量 | 触发情况 |
+| --- | --- | --- |
+| `BatchRetryConflict` | `BATCH_RETRY_CONFLICT` | 相同 `batch_id` 配**不同请求内容**；可观察到 `batch_id`、`original_request_digest`、`incoming_request_digest`（sha256 十六进制摘要）与 `original_execution_id` |
+| `BatchIdentifierInvalid` | `BATCH_IDENTIFIER_INVALID` | `batch_id` / `execution_id` 缺失或去首尾空白后为空（`reason` 分别为 `MISSING_BATCH_ID` / `MISSING_EXECUTION_ID`），或请求摘要无法计算（`UNCOMPUTABLE_REQUEST_DIGEST`） |
+
+- 冲突拒绝不改变任何状态；之后以与首次相同的内容重试，仍返回首次结果。
+- 批次内容本身的既有校验异常（空批次 `EmptyBatchError`、缺币种
+  `InvalidCurrencyError`、混合币种 `MixedCurrencyError`、重复流水号
+  `DuplicateTransactionError`、空债权清单 `EmptyCreditorListError`、
+  风险系数越界 `InvalidRiskFactorError`、非法金额 `ValueError` 等）仍按
+  原口径抛出，不被新拒绝结果替代；校验失败不登记批次、不产生副作用，
+  修正后可用同一 `batch_id` 重新首次提交。
+- 重试语义只在引擎实例内内存中保留，无落盘行为；三个可重试入口仅提供
+  `ClearingEngine` 方法，没有模块级一次性函数。
+
 ## 处理规则（确定顺序）
 
 1. **输入校验**：负数金额/余额、重复流水号、缺币种、空债权清单、系数越界

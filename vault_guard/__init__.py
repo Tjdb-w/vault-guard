@@ -18,6 +18,11 @@
   批次入口（不换汇、不使用汇率）；
 - :meth:`ClearingEngine.process_recovery`：存续坏账回收入口（回收依赖台账
   状态，仅提供引擎方法，无模块级一次性入口）；
+- :meth:`ClearingEngine.process_batch_retry` /
+  :meth:`ClearingEngine.process_risk_group_batch_retry` /
+  :meth:`ClearingEngine.process_multicurrency_batch_retry`：已进入清算处理
+  的批次的可重试与断点恢复入口（稳定批次标识 + 本次执行标识；重试不重复
+  扣减 / 归因 / 审计，内容冲突与标识无效分别返回唯一拒绝结果）；
 - :class:`~vault_guard.models.SettlementRequest` 等数据模型；
 - :mod:`vault_guard.errors` 中定义的各类异常（负数使用内建
   :class:`ValueError`）。
@@ -44,8 +49,15 @@ from .errors import (
 )
 from .models import (
     AuditEvent,
+    BatchIdentifierInvalid,
     BatchPreviewResult,
+    BatchRetryConflict,
     BatchSettlementResult,
+    BATCH_INVALID_REASON_MISSING_BATCH_ID,
+    BATCH_INVALID_REASON_MISSING_EXECUTION_ID,
+    BATCH_INVALID_REASON_UNCOMPUTABLE_DIGEST,
+    BATCH_OUTCOME_INVALID_IDENTIFIER,
+    BATCH_OUTCOME_RETRY_CONFLICT,
     Creditor,
     CreditorAttribution,
     CurrencyAuditSummary,
@@ -85,6 +97,13 @@ __all__ = [
     "CreditorAttribution",
     "CurrencyAuditSummary",
     "AuditEvent",
+    "BatchRetryConflict",
+    "BatchIdentifierInvalid",
+    "BATCH_OUTCOME_RETRY_CONFLICT",
+    "BATCH_OUTCOME_INVALID_IDENTIFIER",
+    "BATCH_INVALID_REASON_MISSING_BATCH_ID",
+    "BATCH_INVALID_REASON_MISSING_EXECUTION_ID",
+    "BATCH_INVALID_REASON_UNCOMPUTABLE_DIGEST",
     "VaultGuardError",
     "DuplicateTransactionError",
     "InvalidCurrencyError",

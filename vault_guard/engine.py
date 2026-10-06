@@ -52,13 +52,29 @@
 ``recovery_allocations`` 保存同额明细），失败不生成事件、不占流水号、
 不改状态。
 
+批次重试与断点恢复（:meth:`ClearingEngine.process_batch_retry` /
+:meth:`ClearingEngine.process_risk_group_batch_retry` /
+:meth:`ClearingEngine.process_multicurrency_batch_retry`）在既有三类批次
+入口之上增加稳定批次标识（``batch_id``）与本次执行标识
+（``execution_id``）：相同批次标识配相同请求内容时，无论执行标识是否
+相同，都返回首次的同一清算结果，不重复扣减、不重复归因、不重复追加审计；
+处理中断后从首个未完成步骤继续，已完成步骤不重复产生副作用。相同批次
+标识配不同内容在任何资金或审计副作用之前返回 :class:`BatchRetryConflict`；
+标识缺失 / 为空或请求摘要无法计算在副作用之前返回
+:class:`BatchIdentifierInvalid`。每批次一把锁，并发提交只允许一个请求
+推进，其余等待同一最终结果。三类入口仅提供引擎方法，状态只在实例内存中
+保留。
+
 校验异常不产生任何分配，也不写入台账；重复流水号在任何状态变更之前抛出。
 """
 
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from decimal import Decimal, InvalidOperation
+from hashlib import sha256
+import json
 from math import isfinite
+from threading import Lock
 from types import MappingProxyType
 from typing import Union
 
@@ -75,8 +91,13 @@ from .errors import (
 )
 from .models import (
     AuditEvent,
+    BatchIdentifierInvalid,
     BatchPreviewResult,
+    BatchRetryConflict,
     BatchSettlementResult,
+    BATCH_INVALID_REASON_MISSING_BATCH_ID,
+    BATCH_INVALID_REASON_MISSING_EXECUTION_ID,
+    BATCH_INVALID_REASON_UNCOMPUTABLE_DIGEST,
     Creditor,
     CreditorAttribution,
     CurrencyAuditSummary,
@@ -118,6 +139,126 @@ class _BadDebtEntry:
     creditor: str
     currency: str
     remaining: Decimal
+
+
+@dataclass
+class _BatchRun:
+    """一个稳定批次标识的幂等执行记录（引擎私有，可变）。
+
+    - ``kind``：批次类型（``single`` / ``risk_group`` / ``multicurrency``）。
+    - ``request_digest``：首次登记的完整请求内容确定性摘要。
+    - ``original_execution_id``：首次执行标识。
+    - ``normalized``：首次调用归一化后的请求序列（含滚动余额执行所需事实）。
+    - ``opening`` / ``balances`` / ``new_limits``：各类型批次执行参数。
+    - ``currency``：单币种批次的币种；多币种批次为 ``None``。
+    - ``completed_items``：按请求顺序已完成步骤的结果（断点恢复据此跳过）。
+    - ``result``：整批完成后的公开结果；未完成时为 ``None``。
+    - ``done_event``：本批次推进锁 / 完成信号；并发调用只允许一个推进。
+    """
+
+    kind: str
+    request_digest: str
+    original_execution_id: str
+    normalized: list[SettlementRequest]
+    opening: Decimal | None = None
+    balances: dict[str, Decimal] | None = None
+    new_limits: dict[str, Decimal] | None = None
+    currency: str | None = None
+    completed_items: list[SettlementResult] = field(default_factory=list)
+    result: object = None
+    done_event: Lock = field(default_factory=Lock)
+
+
+def _stable_json(value: object) -> str:
+    """把批次输入递归归一化为确定性 JSON 文本。
+
+    映射键排序、元组按序列处理；数值按引擎金额归一化口径统一为 Decimal
+    的精确规范形式（``int`` / ``float`` / ``Decimal`` 的等价值摘要相同，
+    ``float`` 经 ``str(value)`` 转换，不引入二进制尾数）；不可 JSON 化的
+    类型（如集合、自定义对象）向上抛出，由调用方转成“请求摘要无法计算”
+    的标识无效结果。
+    """
+
+    def canonical_number(node: object) -> str:
+        decimal_value = (
+            Decimal(str(node)) if isinstance(node, float) else Decimal(node)
+        )
+        # 统一指数写法：40 / 40.0 / 40.00 摘要一致；非有限值保留确定性文本，
+        # 由后续既有校验按原口径处理。
+        if decimal_value.is_finite():
+            decimal_value = (decimal_value + _ZERO).normalize()
+            return format(decimal_value, "f")
+        return format(decimal_value, "f")
+
+    def normalize(node: object) -> object:
+        if node is None or isinstance(node, (bool, str)):
+            return node
+        if isinstance(node, (int, float, Decimal)):
+            return {"__decimal__": canonical_number(node)}
+        if isinstance(node, Creditor):
+            # 公开支持的债权对象：按其 (name, amount, currency) 事实参与摘要。
+            return {
+                "name": node.name,
+                "amount": {"__decimal__": canonical_number(node.amount)},
+                "currency": node.currency,
+            }
+        if isinstance(node, Mapping):
+            return {
+                str(key): normalize(node[key])
+                for key in sorted(node, key=lambda k: str(k))
+            }
+        if isinstance(node, (list, tuple)):
+            return [normalize(item) for item in node]
+        raise TypeError(f"不支持请求摘要的输入类型: {type(node).__name__}")
+
+    return json.dumps(
+        normalize(value), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+
+
+def _request_digest(kind: str, payload: Mapping[str, object]) -> str:
+    """计算批次完整请求内容的 sha256 摘要（十六进制文本）。"""
+    canonical = _stable_json({"kind": kind, "payload": payload})
+    return sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _invalid_batch_identifier(
+    batch_id: object, execution_id: object
+) -> BatchIdentifierInvalid | None:
+    """校验批次标识与执行标识；无效返回唯一结果，有效返回 None。"""
+    if not isinstance(batch_id, str) or not batch_id.strip():
+        return BatchIdentifierInvalid(
+            reason=BATCH_INVALID_REASON_MISSING_BATCH_ID
+        )
+    if not isinstance(execution_id, str) or not execution_id.strip():
+        return BatchIdentifierInvalid(
+            reason=BATCH_INVALID_REASON_MISSING_EXECUTION_ID,
+            batch_id=batch_id.strip(),
+        )
+    return None
+
+
+def _materialize_requests(
+    requests: Iterable[Mapping[str, object]],
+) -> tuple[list[object], bool]:
+    """把请求序列具化为列表；缺失或不可迭代时返回 ``([], True)``。"""
+    try:
+        return list(requests), False
+    except TypeError:
+        return [], True
+
+
+def _digest_or_invalid(
+    kind: str, payload: Mapping[str, object], batch_key: str
+) -> tuple[str | None, BatchIdentifierInvalid | None]:
+    """计算摘要；输入含无法归一化的内容时返回标识无效结果。"""
+    try:
+        return _request_digest(kind, payload), None
+    except (TypeError, ValueError, InvalidOperation):
+        return None, BatchIdentifierInvalid(
+            reason=BATCH_INVALID_REASON_UNCOMPUTABLE_DIGEST,
+            batch_id=batch_key,
+        )
 
 
 def _as_decimal(value: object, field: str) -> Decimal:
@@ -167,6 +308,10 @@ class ClearingEngine:
         # 存续坏账台账（按事件顺序追加）与已登记回收结果。
         self._bad_debt_ledger: list[_BadDebtEntry] = []
         self._recoveries: dict[str, RecoveryResult] = {}
+        # 批次重试与断点恢复：稳定批次标识 -> 执行记录；注册表锁保护
+        # 登记 / 冲突判定，每批次各自的锁串行并发提交。
+        self._batch_runs: dict[str, _BatchRun] = {}
+        self._batch_registry_lock = Lock()
 
     # ------------------------------------------------------------------ #
     # 只读查询（不触发清算，不改变任何状态）
@@ -721,6 +866,344 @@ class ClearingEngine:
             results=tuple(results),
             validated_available_balances=MappingProxyType(working),
         )
+
+    # ------------------------------------------------------------------ #
+    # 批次重试与断点恢复
+    #
+    # 同一稳定批次标识（batch_id）的首次调用走既有的校验 / 清算 / 坏账 /
+    # 审计流程并登记执行记录；后续调用（execution_id 可不同）在任何资金或
+    # 审计副作用之前先比对请求内容摘要：内容相同则返回与首次完全相同的结果，
+    # 不重复扣减、不重复归因、不重复追加审计；内容不同返回唯一的
+    # BatchRetryConflict。处理中断后重提相同请求时，从首个尚未完成的步骤
+    # 继续，已完成步骤不再次产生副作用。每批次一把锁，并发提交只允许一个
+    # 请求推进，其余等待同一最终结果。
+    # ------------------------------------------------------------------ #
+
+    def process_batch_retry(
+        self,
+        batch_id: str,
+        execution_id: str,
+        currency: str,
+        opening_pool_balance: Number,
+        requests: Iterable[Mapping[str, object]],
+    ) -> BatchSettlementResult | BatchRetryConflict | BatchIdentifierInvalid:
+        """同币种批次的可重试 / 断点恢复入口，参数沿用 :meth:`process_batch`。
+
+        额外参数：
+
+        - ``batch_id``：调用方提供的稳定批次标识；同一批次的首次执行与全部
+          重试必须使用相同值。
+        - ``execution_id``：本次执行标识；仅用于区分不同执行尝试，重试时可
+          不同，不影响清算结果与审计内容。
+
+        返回值三选一：
+
+        - 首次成功或内容一致的重试：原有不可变 :class:`BatchSettlementResult`
+          （重试返回首次的同一结果，审计台账不新增事件）；
+        - 相同 ``batch_id`` 配不同请求内容：:class:`BatchRetryConflict`，
+          在任何资金或审计副作用之前拒绝；
+        - 标识缺失 / 为空或请求摘要无法计算：:class:`BatchIdentifierInvalid`，
+          同样在任何副作用之前拒绝。
+
+        批次内容本身的既有校验异常（空批次、缺币种、混合币种、重复流水号、
+        空债权清单、系数越界、非法数值）仍按原口径抛出，不与上述拒绝结果
+        混用。
+        """
+        identifier_error = _invalid_batch_identifier(batch_id, execution_id)
+        if identifier_error is not None:
+            return identifier_error
+        batch_key = batch_id.strip()
+
+        items, unreadable = _materialize_requests(requests)
+        if unreadable:
+            # 清单缺失或不可迭代沿用既有口径：直接由原校验顺序抛
+            # EmptyBatchError，不登记批次、不产生任何副作用。
+            self._validate_batch(currency, opening_pool_balance, requests)
+        digest, digest_error = _digest_or_invalid(
+            "single",
+            {
+                "currency": currency,
+                "opening_pool_balance": opening_pool_balance,
+                "requests": items,
+            },
+            batch_key,
+        )
+        if digest_error is not None:
+            return digest_error
+
+        with self._batch_registry_lock:
+            run = self._batch_runs.get(batch_key)
+            if run is None:
+                # 首次登记前仍按原顺序做整体校验：异常直接抛出，不登记。
+                currency, opening, normalized = self._validate_batch(
+                    currency, opening_pool_balance, items
+                )
+                run = _BatchRun(
+                    kind="single",
+                    request_digest=digest,
+                    original_execution_id=execution_id.strip(),
+                    normalized=normalized,
+                    opening=opening,
+                    currency=currency,
+                )
+                self._batch_runs[batch_key] = run
+            elif run.request_digest != digest:
+                # 不同请求内容：在任何资金或审计副作用之前拒绝。
+                return BatchRetryConflict(
+                    batch_id=batch_key,
+                    original_request_digest=run.request_digest,
+                    incoming_request_digest=digest,
+                    original_execution_id=run.original_execution_id,
+                )
+
+        with run.done_event:
+            if run.result is None:
+                self._complete_single_batch(run)
+            return run.result
+
+    def process_risk_group_batch_retry(
+        self,
+        batch_id: str,
+        execution_id: str,
+        currency: str,
+        opening_pool_balance: Number,
+        risk_group_limits: Mapping[str, Number],
+        requests: Iterable[Mapping[str, object]],
+    ) -> RiskGroupBatchResult | BatchRetryConflict | BatchIdentifierInvalid:
+        """风险组批次的可重试 / 断点恢复入口，参数沿用
+        :meth:`process_risk_group_batch`，``batch_id`` / ``execution_id``
+        语义同 :meth:`process_batch_retry`。
+        """
+        identifier_error = _invalid_batch_identifier(batch_id, execution_id)
+        if identifier_error is not None:
+            return identifier_error
+        batch_key = batch_id.strip()
+
+        items, unreadable = _materialize_requests(requests)
+        if unreadable:
+            self._validate_risk_group_batch(
+                currency, opening_pool_balance, risk_group_limits, requests
+            )
+        digest, digest_error = _digest_or_invalid(
+            "risk_group",
+            {
+                "currency": currency,
+                "opening_pool_balance": opening_pool_balance,
+                "risk_group_limits": risk_group_limits,
+                "requests": items,
+            },
+            batch_key,
+        )
+        if digest_error is not None:
+            return digest_error
+
+        with self._batch_registry_lock:
+            run = self._batch_runs.get(batch_key)
+            if run is None:
+                currency, opening, normalized, new_limits = (
+                    self._validate_risk_group_batch(
+                        currency,
+                        opening_pool_balance,
+                        risk_group_limits,
+                        items,
+                    )
+                )
+                run = _BatchRun(
+                    kind="risk_group",
+                    request_digest=digest,
+                    original_execution_id=execution_id.strip(),
+                    normalized=normalized,
+                    opening=opening,
+                    new_limits=new_limits,
+                    currency=currency,
+                )
+                self._batch_runs[batch_key] = run
+            elif run.request_digest != digest:
+                return BatchRetryConflict(
+                    batch_id=batch_key,
+                    original_request_digest=run.request_digest,
+                    incoming_request_digest=digest,
+                    original_execution_id=run.original_execution_id,
+                )
+
+        with run.done_event:
+            if run.result is None:
+                self._complete_risk_group_batch(run)
+            return run.result
+
+    def process_multicurrency_batch_retry(
+        self,
+        batch_id: str,
+        execution_id: str,
+        opening_pool_balances: Mapping[str, Number],
+        requests: Iterable[Mapping[str, object]],
+    ) -> MulticurrencyBatchResult | BatchRetryConflict | BatchIdentifierInvalid:
+        """多币种批次的可重试 / 断点恢复入口，参数沿用
+        :meth:`process_multicurrency_batch`，``batch_id`` / ``execution_id``
+        语义同 :meth:`process_batch_retry`。
+        """
+        identifier_error = _invalid_batch_identifier(batch_id, execution_id)
+        if identifier_error is not None:
+            return identifier_error
+        batch_key = batch_id.strip()
+
+        items, unreadable = _materialize_requests(requests)
+        if unreadable:
+            self._validate_multicurrency_batch(
+                opening_pool_balances, requests
+            )
+        digest, digest_error = _digest_or_invalid(
+            "multicurrency",
+            {
+                "opening_pool_balances": opening_pool_balances,
+                "requests": items,
+            },
+            batch_key,
+        )
+        if digest_error is not None:
+            return digest_error
+
+        with self._batch_registry_lock:
+            run = self._batch_runs.get(batch_key)
+            if run is None:
+                balances, normalized = self._validate_multicurrency_batch(
+                    opening_pool_balances, items
+                )
+                run = _BatchRun(
+                    kind="multicurrency",
+                    request_digest=digest,
+                    original_execution_id=execution_id.strip(),
+                    normalized=normalized,
+                    balances=balances,
+                )
+                self._batch_runs[batch_key] = run
+            elif run.request_digest != digest:
+                return BatchRetryConflict(
+                    batch_id=batch_key,
+                    original_request_digest=run.request_digest,
+                    incoming_request_digest=digest,
+                    original_execution_id=run.original_execution_id,
+                )
+
+        with run.done_event:
+            if run.result is None:
+                self._complete_multicurrency_batch(run)
+            return run.result
+
+    def _complete_single_batch(self, run: _BatchRun) -> None:
+        """在批次锁内推进同币种批次至完成，跳过已完成步骤（断点恢复）。"""
+        start = len(run.completed_items)
+        balance = (
+            run.completed_items[-1].validated_available_balance
+            if start
+            else run.opening
+        )
+        for request in run.normalized[start:]:
+            request = replace(request, pool_balance=balance)
+            result = self._execute_resumable_item(request)
+            run.completed_items.append(result)
+            balance = result.validated_available_balance
+
+        results = tuple(run.completed_items)
+        run.result = BatchSettlementResult(
+            results=results,
+            event_ids=tuple(result.event_id for result in results),
+            validated_available_balance=balance,
+        )
+
+    def _complete_risk_group_batch(self, run: _BatchRun) -> None:
+        """在批次锁内推进风险组批次至完成，跳过已完成步骤（断点恢复）。"""
+        for group_id, limit in run.new_limits.items():
+            # 重复登记相同上限是幂等的；断点恢复时这些组通常已在引擎中。
+            self._risk_group_limits[group_id] = limit
+            self._risk_group_used.setdefault(group_id, _ZERO)
+
+        start = len(run.completed_items)
+        balance = (
+            run.completed_items[-1].validated_available_balance
+            if start
+            else run.opening
+        )
+        for request in run.normalized[start:]:
+            request = replace(request, pool_balance=balance)
+            result = self._execute_resumable_item(request)
+            run.completed_items.append(result)
+            balance = result.validated_available_balance
+
+        results = tuple(run.completed_items)
+        run.result = RiskGroupBatchResult(
+            results=results,
+            event_ids=tuple(result.event_id for result in results),
+            validated_available_balance=balance,
+            risk_groups=MappingProxyType(
+                {
+                    group_id: RiskGroupUsage(
+                        used=self._risk_group_used[group_id],
+                        limit=limit,
+                        remaining=limit - self._risk_group_used[group_id],
+                    )
+                    for group_id, limit in self._risk_group_limits.items()
+                }
+            ),
+        )
+
+    def _complete_multicurrency_batch(self, run: _BatchRun) -> None:
+        """在批次锁内推进多币种批次至完成，跳过已完成步骤（断点恢复）。"""
+        working = dict(run.balances)
+        for index, result in enumerate(run.completed_items):
+            working[run.normalized[index].currency] = (
+                result.validated_available_balance
+            )
+
+        start = len(run.completed_items)
+        for index in range(start, len(run.normalized)):
+            request = run.normalized[index]
+            request = replace(
+                request, pool_balance=working[request.currency]
+            )
+            result = self._execute_resumable_item(request)
+            run.completed_items.append(result)
+            working[request.currency] = result.validated_available_balance
+
+        results = tuple(run.completed_items)
+        run.result = MulticurrencyBatchResult(
+            results=results,
+            event_ids=tuple(result.event_id for result in results),
+            validated_available_balances=MappingProxyType(working),
+        )
+
+    def _execute_resumable_item(
+        self, request: SettlementRequest
+    ) -> SettlementResult:
+        """执行断点恢复批次中的单个步骤。
+
+        基于已校验数据执行不会失败；若意外抛错，仅回滚当前步骤的状态
+        （事件、序号、流水号、结果索引、该步骤的风险组占用、坏账台账），
+        执行记录不计入该步骤，下一轮推进从同一请求重新执行，从而不会出现
+        两套金额分配或两条等价审计轨迹。
+        """
+        events_mark = len(self._events)
+        sequence_mark = self._sequence
+        ledger_mark = len(self._bad_debt_ledger)
+        group_id = request.risk_group_id
+        group_used_before = (
+            self._risk_group_used.get(group_id, _ZERO)
+            if group_id is not None
+            else None
+        )
+        tid = request.transaction_id
+        self._seen_transactions.add(tid)
+        try:
+            return self._execute(request)
+        except Exception:
+            del self._events[events_mark:]
+            self._sequence = sequence_mark
+            del self._bad_debt_ledger[ledger_mark:]
+            if group_id is not None:
+                self._risk_group_used[group_id] = group_used_before
+            self._seen_transactions.discard(tid)
+            self._results.pop(tid, None)
+            raise
 
     def process_recovery(
         self,
