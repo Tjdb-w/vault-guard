@@ -25,6 +25,9 @@
   :meth:`ClearingEngine.process_multicurrency_batch_retry`：已进入清算处理
   的批次的可重试与断点恢复入口（稳定批次标识 + 本次执行标识；重试不重复
   扣减 / 归因 / 审计，内容冲突与标识无效分别返回唯一拒绝结果）；
+- :meth:`ClearingEngine.creditor_bad_debt_report`：债权人维度坏账只读
+  查询入口（按债权人合并多来源坏账与回收 / 核销分配，不新增事件、不改
+  台账）；
 - :class:`~vault_guard.models.SettlementRequest` 等数据模型；
 - :mod:`vault_guard.errors` 中定义的各类异常（负数使用内建
   :class:`ValueError`）。
@@ -63,6 +66,7 @@ from .models import (
     BATCH_OUTCOME_RETRY_CONFLICT,
     Creditor,
     CreditorAttribution,
+    CreditorBadDebtSummary,
     CurrencyAuditSummary,
     MulticurrencyBatchResult,
     MulticurrencyBatchPreviewResult,
@@ -102,6 +106,7 @@ __all__ = [
     "OutstandingBadDebt",
     "Creditor",
     "CreditorAttribution",
+    "CreditorBadDebtSummary",
     "CurrencyAuditSummary",
     "AuditEvent",
     "BatchRetryConflict",

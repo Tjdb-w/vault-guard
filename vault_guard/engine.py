@@ -60,6 +60,14 @@
 （序号继续递增，``writeoff_allocations`` 保存同额明细；结算与回收事件
 该字段恒为空元组），失败不生成事件、不占流水号、不改状态。
 
+债权人维度坏账查询（:meth:`ClearingEngine.creditor_bad_debt_report`）为
+只读入口：按债权人合并该币种放行归因坏账大于零的全部来源记录，全额结清
+留行，三类交易标识按事件顺序去重，金额满足
+``initial_bad_debt - recovered_amount - written_off_amount ==
+outstanding_bad_debt`` 且后者等于 :meth:`outstanding_bad_debts` 中该
+债权人的来源余额合计；空明细零额回收 / 核销不归属债权人。可选债权名清单
+只返回命中行，未命中不报错；查询不新增事件、不改变任何台账状态。
+
 批次重试与断点恢复（:meth:`ClearingEngine.process_batch_retry` /
 :meth:`ClearingEngine.process_risk_group_batch_retry` /
 :meth:`ClearingEngine.process_multicurrency_batch_retry`）在既有三类批次
@@ -109,6 +117,7 @@ from .models import (
     BATCH_INVALID_REASON_UNCOMPUTABLE_DIGEST,
     Creditor,
     CreditorAttribution,
+    CreditorBadDebtSummary,
     CurrencyAuditSummary,
     MulticurrencyBatchResult,
     MulticurrencyBatchPreviewResult,
@@ -305,8 +314,8 @@ class ClearingEngine:
     审计台账为实例内内存中的追加式序列（``self.audit_log``），只读查询
     （:meth:`get_event` / :meth:`events` / :meth:`result_of` /
     :meth:`recovery_of` / :meth:`writeoff_of` /
-    :meth:`outstanding_bad_debts` /
-    :meth:`audit_reconciliation`）不触发清算。
+    :meth:`outstanding_bad_debts` / :meth:`audit_reconciliation` /
+    :meth:`creditor_bad_debt_report`）不触发清算。
     """
 
     def __init__(self) -> None:
@@ -480,6 +489,152 @@ class ClearingEngine:
             ),
             event_ids=tuple(event_ids),
         )
+
+    def creditor_bad_debt_report(
+        self,
+        currency: str,
+        creditor_names: Union[list[str], tuple[str, ...], None] = None,
+    ) -> tuple[CreditorBadDebtSummary, ...]:
+        """返回该币种按债权人维度合并的只读坏账汇总。
+
+        每行 :class:`CreditorBadDebtSummary` 合并同一债权人名下的多来源
+        记录，仅包含放行归因坏账（``bad_debt > 0``）的债权人；全额结清
+        （回收 / 核销后余额为 0）的债权人仍保留汇总行。三类交易标识均按
+        审计事件顺序去重：
+
+        - ``source_transaction_ids``：放行归因坏账大于零的来源结算流水号；
+        - ``recovery_transaction_ids``：存在实际冲减该债权人分配的回收
+          流水号；空明细的零额回收不归属任何债权人；
+        - ``writeoff_transaction_ids``：存在实际核销该债权人分配的核销
+          流水号；空明细的零额核销不归属任何债权人。
+
+        金额均为 :class:`decimal.Decimal`：``initial_bad_debt`` 汇总放行
+        归因坏账，``recovered_amount`` / ``written_off_amount`` 汇总现有
+        回收 / 核销分配，``outstanding_bad_debt`` 为
+        ``initial_bad_debt - recovered_amount - written_off_amount``，
+        恒等于 :meth:`outstanding_bad_debts` 中该债权人的来源余额合计。
+
+        行序默认按来源结算首次出现顺序、同一事件内按债权清单顺序排列；
+        指定 ``creditor_names`` 时只返回命中行（仍按上述默认顺序），未命中
+        不报错，重复名称只返回一行。
+
+        - ``currency`` 沿用既有校验：非字符串或去首尾空白后为空抛
+          :class:`InvalidCurrencyError`，匹配时去除首尾空白；
+        - ``creditor_names`` 为 ``None`` 返回全部命中行；为空序列（含空
+          元组）返回空元组；非 ``list`` / ``tuple``，或元素非字符串 / 空白
+          抛内建 :class:`ValueError`；
+        - 空台账或该币种无坏账时返回空元组。
+
+        查询只读且可重复：不新增事件，不改审计序号、事件、结果索引、
+        流水号去重、风险组、资金池、结果与坏账状态。
+        """
+        if not isinstance(currency, str) or not currency.strip():
+            raise InvalidCurrencyError("账户币种缺失或为空")
+        currency = currency.strip()
+
+        if creditor_names is None:
+            wanted: set[str] | None = None
+        else:
+            if not isinstance(creditor_names, (list, tuple)):
+                raise ValueError(
+                    "creditor_names 必须是 list、tuple 或 None，收到 "
+                    f"{type(creditor_names).__name__}"
+                )
+            wanted = set()
+            for index, name in enumerate(creditor_names):
+                if not isinstance(name, str) or not name.strip():
+                    raise ValueError(
+                        f"creditor_names[{index}] 必须是非空字符串"
+                    )
+                wanted.add(name.strip())
+            if not wanted:
+                return ()
+
+        # 以债权人首次出现（来源结算首次归因坏账）的顺序登记合并桶。
+        order: list[str] = []
+        rows: dict[str, dict[str, object]] = {}
+
+        def bucket(creditor: str) -> dict[str, object]:
+            row = rows.get(creditor)
+            if row is None:
+                row = {
+                    "sources": [],
+                    "source_seen": set(),
+                    "recoveries": [],
+                    "writeoffs": [],
+                    "initial": _ZERO,
+                    "recovered": _ZERO,
+                    "written_off": _ZERO,
+                }
+                rows[creditor] = row
+                order.append(creditor)
+            return row
+
+        for event in self._events:
+            if event.currency != currency:
+                continue
+            if event.validation_result == "RECOVERY":
+                # 同一回收事件可经多条分配命中同一债权人，交易标识只记一次。
+                registered: set[str] = set()
+                for _source_id, creditor, amount, _remaining in (
+                    event.recovery_allocations
+                ):
+                    row = bucket(creditor)
+                    row["recovered"] += amount
+                    if creditor not in registered:
+                        row["recoveries"].append(event.transaction_id)
+                        registered.add(creditor)
+                continue
+            if event.validation_result == "WRITEOFF":
+                registered = set()
+                for _source_id, creditor, amount, _remaining in (
+                    event.writeoff_allocations
+                ):
+                    row = bucket(creditor)
+                    row["written_off"] += amount
+                    if creditor not in registered:
+                        row["writeoffs"].append(event.transaction_id)
+                        registered.add(creditor)
+                continue
+
+            # 结算事件：仅合并放行归因 bad_debt 大于零的债权。
+            result = self._results.get(event.transaction_id)
+            if result is None or not result.approved:
+                continue
+            for attribution in result.attributions:
+                if attribution.bad_debt <= _ZERO:
+                    continue
+                row = bucket(attribution.creditor)
+                row["initial"] += attribution.bad_debt
+                if event.transaction_id not in row["source_seen"]:
+                    row["sources"].append(event.transaction_id)
+                    row["source_seen"].add(event.transaction_id)
+
+        summaries: list[CreditorBadDebtSummary] = []
+        for creditor in order:
+            row = rows[creditor]
+            initial = row["initial"]
+            if initial <= _ZERO:
+                # 仅保留放行归因坏账大于零者（回收 / 核销不会先于来源出现，
+                # 此判断为防御性口径对齐）。
+                continue
+            if wanted is not None and creditor not in wanted:
+                continue
+            recovered = row["recovered"]
+            written_off = row["written_off"]
+            summaries.append(
+                CreditorBadDebtSummary(
+                    creditor=creditor,
+                    source_transaction_ids=tuple(row["sources"]),
+                    recovery_transaction_ids=tuple(row["recoveries"]),
+                    writeoff_transaction_ids=tuple(row["writeoffs"]),
+                    initial_bad_debt=initial,
+                    recovered_amount=recovered,
+                    written_off_amount=written_off,
+                    outstanding_bad_debt=initial - recovered - written_off,
+                )
+            )
+        return tuple(summaries)
 
     # ------------------------------------------------------------------ #
     # 公开入口

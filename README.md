@@ -376,6 +376,7 @@ writeoff = engine.process_writeoff("WO-001", "USD", Decimal("10"))
   `engine.writeoff_of(writeoff_transaction_id)`、
   `engine.outstanding_bad_debts(currency)`、
   `engine.audit_reconciliation(currency)`、
+  `engine.creditor_bad_debt_report(currency, creditor_names=None)`、
   `engine.has_transaction(transaction_id)`。
 
 ### 单币种审计核对快照
@@ -411,6 +412,44 @@ rejected_count`。
 - `currency` 非字符串或去首尾空白后为空抛 `InvalidCurrencyError`；匹配时
   去除首尾空白；台账中未出现的币种除 `currency` 外全为零，
   `rejection_counts` 与 `event_ids` 为空序列，空台账结果确定。
+
+### 债权人维度坏账汇总
+
+`ClearingEngine.creditor_bad_debt_report(currency, creditor_names=None)`
+在同一口径下按**债权人维度**合并该币种的坏账形成、回收与核销，返回不可变
+`CreditorBadDebtSummary` 元组，金额均为 `Decimal`：
+
+```python
+# 全部命中债权人；也可传入债权名清单做过滤（None 或缺省返回全部）
+rows = engine.creditor_bad_debt_report("USD")
+rows = engine.creditor_bad_debt_report("USD", ("bank-a", "fund-b"))
+```
+
+每行合并同一债权人名下的多来源记录，字段依次为：
+
+| 字段 | 含义 |
+| --- | --- |
+| `creditor` | 债权名 |
+| `source_transaction_ids` | 放行归因坏账（`bad_debt > 0`）的来源结算流水号，按审计事件顺序去重 |
+| `recovery_transaction_ids` | 实际冲减该债权人坏账的回收流水号，按审计事件顺序去重 |
+| `writeoff_transaction_ids` | 实际核销该债权人坏账的核销流水号，按审计事件顺序去重 |
+| `initial_bad_debt` | 放行归因首次坏账合计 |
+| `recovered_amount` | 现有回收分配对该债权人的冲减额合计 |
+| `written_off_amount` | 现有核销分配对该债权人的核销额合计 |
+| `outstanding_bad_debt` | 初始坏账减回收、核销两项，恒等于 `outstanding_bad_debts(currency)` 中该债权人的来源余额合计 |
+
+- 仅保留放行归因坏账大于零的债权人；回收 / 核销后**全额结清的债权人仍
+  保留汇总行**（`outstanding_bad_debt` 为 0）。
+- 空明细的零额回收 / 核销不归属任何债权人，因此不会因零额事件新增交易
+  标识；同一事件对同一债权人有多条分配时，交易标识只出现一次。
+- 行序默认按来源结算首次出现顺序、同一事件内按债权清单顺序排列；
+  `creditor_names` 过滤不改变行序，未命中不报错，重复名称只返回一行。
+- `creditor_names` 为 `None`（或缺省）返回全部命中行；空元组 / 空列表
+  返回空元组；非 `list` / `tuple`，或元素非字符串 / 空白抛 `ValueError`。
+- `currency` 沿用既有校验：非字符串或空白抛 `InvalidCurrencyError`，
+  匹配时去除首尾空白；空台账与该币种无坏账均返回空元组。
+- 查询只读且可重复：不新增事件，不改 `audit_log`、事件、审计序号、
+  `transaction_id` 去重、风险组、资金池、结果与坏账状态，不落盘、不换汇。
 
 ## 测试
 
