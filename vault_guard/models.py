@@ -23,6 +23,8 @@ __all__ = [
     "MulticurrencyBatchPreviewResult",
     "RecoveryAllocation",
     "RecoveryResult",
+    "WriteoffAllocation",
+    "WriteoffResult",
     "OutstandingBadDebt",
     "CurrencyAuditSummary",
     "AuditEvent",
@@ -305,6 +307,41 @@ class RecoveryResult:
 
 
 @dataclass(frozen=True)
+class WriteoffAllocation:
+    """一笔核销对单笔存续坏账的核销明细（按核销顺序排列）。
+
+    - ``source_transaction_id``：产生该坏账的来源结算流水号。
+    - ``creditor``：被核销的债权名。
+    - ``written_off_amount``：本次核销对该笔坏账的核销额。
+    - ``remaining_bad_debt``：核销后该笔坏账的剩余余额。
+    """
+
+    source_transaction_id: str
+    creditor: str
+    written_off_amount: Decimal
+    remaining_bad_debt: Decimal
+
+
+@dataclass(frozen=True)
+class WriteoffResult:
+    """存续坏账核销的公开返回结构（不可变）。
+
+    - ``writeoff_amount``：归一化后的核销额。
+    - ``allocations``：按核销顺序排列的 :class:`WriteoffAllocation`。
+    - ``total_written_off``：本次核销合计（等于 ``writeoff_amount``）。
+    - ``outstanding_bad_debt``：核销后该币种的存续坏账总额。
+    """
+
+    writeoff_transaction_id: str
+    currency: str
+    writeoff_amount: Decimal
+    allocations: tuple[WriteoffAllocation, ...]
+    total_written_off: Decimal
+    outstanding_bad_debt: Decimal
+    event_id: str
+
+
+@dataclass(frozen=True)
 class OutstandingBadDebt:
     """查询时点的一笔存续坏账余额。
 
@@ -327,13 +364,15 @@ class CurrencyAuditSummary:
     - ``settlement_count``：结算事件总数（放行与拒绝）。
     - ``approved_count`` / ``rejected_count``：放行 / 拒绝结算事件数。
     - ``recovery_count``：回收事件数。
+    - ``writeoff_count``：核销事件数。
     - ``approved_risk_occupancy``：仅放行请求的风险占用合计。
     - ``pool_allocated``：放行请求池内分配按明细求和。
     - ``capital_allocated``：放行请求补充资本按明细求和。
     - ``initial_bad_debt``：放行时确认的首次坏账（未覆盖坏账）合计。
-    - ``recovered_amount``：回收冲减额合计。
+    - ``recovered_amount``：回收冲减额合计（只计回收事件）。
+    - ``written_off_amount``：核销冲减额合计（只计核销事件）。
     - ``outstanding_bad_debt``：该币种存续坏账余额合计，恒等于
-      ``initial_bad_debt - recovered_amount``。
+      ``initial_bad_debt - recovered_amount - written_off_amount``。
     - ``rejection_counts``：按原因码排序的不可变原因次数（省略零次原因）。
     - ``event_ids``：该币种全部审计事件标识，保持台账顺序。
     """
@@ -343,11 +382,13 @@ class CurrencyAuditSummary:
     approved_count: int
     rejected_count: int
     recovery_count: int
+    writeoff_count: int
     approved_risk_occupancy: Decimal
     pool_allocated: Decimal
     capital_allocated: Decimal
     initial_bad_debt: Decimal
     recovered_amount: Decimal
+    written_off_amount: Decimal
     outstanding_bad_debt: Decimal
     rejection_counts: Mapping[str, int]
     event_ids: tuple[str, ...]
@@ -374,8 +415,11 @@ class AuditEvent:
     validated_available_balance: Decimal
     rejection_reason: str | None
     # 回收事件的冲减明细：
-    # (来源结算流水号, 债权名, 本次冲减额, 剩余坏账)；结算事件恒为空元组。
+    # (来源结算流水号, 债权名, 本次冲减额, 剩余坏账)；结算与核销事件恒为空元组。
     recovery_allocations: tuple[tuple[str, str, Decimal, Decimal], ...] = ()
+    # 核销事件的核销明细：
+    # (来源结算流水号, 债权名, 本次核销额, 剩余坏账)；结算与回收事件恒为空元组。
+    writeoff_allocations: tuple[tuple[str, str, Decimal, Decimal], ...] = ()
 
 
 # --------------------------------------------------------------------------- #

@@ -182,7 +182,8 @@ batch = engine.process_multicurrency_batch(
   `EmptyCreditorListError`；风险系数越界 → `InvalidRiskFactorError`。
 - 逐笔规则（限额、瀑布、补充资本、坏账归因、两种拒绝原因码）与单币种
   批次一致；放行或拒绝各产生一条既有结构审计事件，拒绝后继续处理。
-- 未覆盖坏账按各自币种进入存续坏账台账，可由 `process_recovery` 冲减。
+- 未覆盖坏账按各自币种进入存续坏账台账，可由 `process_recovery` 冲减、
+  由 `process_writeoff` 核销结清。
 
 返回不可变的 `MulticurrencyBatchResult`：
 
@@ -302,6 +303,32 @@ recovery = engine.process_recovery("RC-001", "USD", Decimal("25"))
   按台账顺序返回该币种剩余明细（来源流水号、债权名、币种、余额），其他
   币种不受影响。
 
+## 坏账核销
+
+无法收回的存续坏账可用
+`ClearingEngine.process_writeoff(writeoff_transaction_id, currency,
+writeoff_amount)` 结清（核销依赖台账状态，仅提供引擎方法）：
+
+```python
+writeoff = engine.process_writeoff("WO-001", "USD", Decimal("10"))
+```
+
+- 核销顺序：先按审计事件顺序、再按债权清单顺序，只核销币种相符且仍有
+  余额的坏账明细；前项清零后处理后项，一笔核销可部分覆盖单项坏账。
+- 返回不可变 `WriteoffResult`：核销流水号、币种、核销额、按核销顺序排列
+  的 `WriteoffAllocation`（来源结算流水号、债权名、本次核销、剩余坏账）、
+  核销合计、核销后该币种存续坏账与事件标识。
+- 核销只减少存续坏账，不改其他状态；历史 `SettlementResult` 不回写。
+  核销成功追加一条标识为 `EVT-{writeoff_transaction_id}-writeoff` 的
+  审计事件（序号继续递增，`approved=True`、`validation_result=WRITEOFF`、
+  `risk_occupancy=0`，`writeoff_allocations` 保存同额明细；结算与回收
+  事件该字段恒为空元组，回收事件的 `recovery_allocations` 不受影响）。
+- 有坏账时零额核销合法，生成一条空明细事件；失败（流水号缺失 / 为空 /
+  重复、缺币种、非法金额、无存续坏账、超额）不生成事件、不占流水号、
+  不改状态。
+- 只读查询不触发清算：`engine.writeoff_of(writeoff_transaction_id)` 返回
+  `WriteoffResult` 或 `None`。
+
 ## 返回结构
 
 成功与拒绝路径使用同构的 `SettlementResult`：
@@ -331,8 +358,9 @@ recovery = engine.process_recovery("RC-001", "USD", Decimal("25"))
 | 风险系数越界（< 0 或 > 1） | `vault_guard.InvalidRiskFactorError` |
 | 单笔请求内混合币种 | `vault_guard.MixedCurrencyError` |
 | 空批次请求清单 | `vault_guard.EmptyBatchError` |
-| 回收币种无存续坏账（含此时零额回收） | `vault_guard.NoOutstandingBadDebtError` |
+| 回收币种无存续坏账（含此时零额回收 / 核销） | `vault_guard.NoOutstandingBadDebtError` |
 | 回收额超过该币种存续坏账 | `vault_guard.RecoveryAmountExceedsOutstandingError` |
+| 核销额超过该币种存续坏账 | `vault_guard.WriteoffAmountExceedsOutstandingError` |
 
 校验异常不产生任何半成品分配，也不写入审计台账；失败请求的流水号不被占用，
 可在修正后用同一流水号重新提交。
@@ -345,6 +373,7 @@ recovery = engine.process_recovery("RC-001", "USD", Decimal("25"))
 - 只读查询不触发清算：`engine.audit_log`（快照）、`engine.events()`、
   `engine.get_event(transaction_id)`、`engine.result_of(transaction_id)`、
   `engine.recovery_of(recovery_transaction_id)`、
+  `engine.writeoff_of(writeoff_transaction_id)`、
   `engine.outstanding_bad_debts(currency)`、
   `engine.audit_reconciliation(currency)`、
   `engine.has_transaction(transaction_id)`。
@@ -352,30 +381,33 @@ recovery = engine.process_recovery("RC-001", "USD", Decimal("25"))
 ### 单币种审计核对快照
 
 `ClearingEngine.audit_reconciliation(currency)` 返回不可变的
-`CurrencyAuditSummary`，把限额拒绝、清算分配、坏账形成与回收冲减放在同一
-口径下核对。按审计顺序统计该币种事件，金额均为 `Decimal`：
+`CurrencyAuditSummary`，把限额拒绝、清算分配、坏账形成、回收冲减与核销
+结清放在同一口径下核对。按审计顺序统计该币种事件，金额均为 `Decimal`：
 
 | 字段 | 含义 |
 | --- | --- |
 | `currency` | 去首尾空白后的查询币种 |
-| `settlement_count` | 结算事件总数（放行 + 拒绝，不含回收） |
+| `settlement_count` | 结算事件总数（放行 + 拒绝，不含回收与核销） |
 | `approved_count` | 放行结算事件数 |
 | `rejected_count` | 拒绝结算事件数 |
 | `recovery_count` | 回收事件数（含空明细的零额回收） |
+| `writeoff_count` | 核销事件数（含空明细的零额核销） |
 | `approved_risk_occupancy` | 仅放行请求的风险占用合计 |
 | `pool_allocated` | 放行请求池内分配按明细求和 |
 | `capital_allocated` | 放行请求补充资本按明细求和 |
 | `initial_bad_debt` | 放行时确认的首次坏账合计（未覆盖坏账） |
-| `recovered_amount` | 各回收事件冲减额按明细求和 |
+| `recovered_amount` | 各回收事件冲减额按明细求和（只计回收） |
+| `written_off_amount` | 各核销事件核销额按明细求和（只计核销） |
 | `outstanding_bad_debt` | `outstanding_bad_debts(currency)` 余额合计 |
 | `rejection_counts` | 按原因码排序的不可变原因次数映射，省略零次原因 |
-| `event_ids` | 该币种全部事件标识，保持台账顺序（结算与回收） |
+| `event_ids` | 该币种全部事件标识，保持台账顺序（结算、回收与核销） |
 
-核对恒等式：`initial_bad_debt - recovered_amount == outstanding_bad_debt`，
-且 `settlement_count == approved_count + rejected_count`。
+核对恒等式：`initial_bad_debt - recovered_amount - written_off_amount ==
+outstanding_bad_debt`，且 `settlement_count == approved_count +
+rejected_count`。
 
-- 查询只读：重复调用不改变审计序号、事件、结果索引、风险组额度、坏账与
-  回收状态。
+- 查询只读：重复调用不改变审计序号、事件、结果索引、风险组额度、坏账、
+  回收与核销状态。
 - `currency` 非字符串或去首尾空白后为空抛 `InvalidCurrencyError`；匹配时
   去除首尾空白；台账中未出现的币种除 `currency` 外全为零，
   `rejection_counts` 与 `event_ids` 为空序列，空台账结果确定。

@@ -12,6 +12,7 @@
 - 风险组标识 / 限额错误 -> :class:`InvalidRiskGroupError`
 - 回收币种无存续坏账 -> :class:`NoOutstandingBadDebtError`
 - 回收额超过存续坏账 -> :class:`RecoveryAmountExceedsOutstandingError`
+- 核销额超过存续坏账 -> :class:`WriteoffAmountExceedsOutstandingError`
 """
 
 __all__ = [
@@ -25,6 +26,7 @@ __all__ = [
     "InvalidRiskGroupError",
     "NoOutstandingBadDebtError",
     "RecoveryAmountExceedsOutstandingError",
+    "WriteoffAmountExceedsOutstandingError",
 ]
 
 
@@ -66,3 +68,7 @@ class NoOutstandingBadDebtError(VaultGuardError):
 
 class RecoveryAmountExceedsOutstandingError(VaultGuardError):
     """回收金额超过该币种存续坏账总额。"""
+
+
+class WriteoffAmountExceedsOutstandingError(VaultGuardError):
+    """核销金额超过该币种存续坏账总额。"""
