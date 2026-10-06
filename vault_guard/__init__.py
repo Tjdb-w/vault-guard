@@ -16,6 +16,9 @@
 - :meth:`ClearingEngine.process_multicurrency_batch` /
   :func:`process_settlement_multicurrency_batch`：按币种独立记账的多币种
   批次入口（不换汇、不使用汇率）；
+- :meth:`ClearingEngine.process_batch_with_retry`：批次重试与断点恢复
+  入口（稳定批次标识 + 本次执行标识；相同内容重试返回首次结果，中断后
+  从未完步骤继续；依赖引擎内批次登记状态，仅提供引擎方法）；
 - :meth:`ClearingEngine.process_recovery`：存续坏账回收入口（回收依赖台账
   状态，仅提供引擎方法，无模块级一次性入口）；
 - :class:`~vault_guard.models.SettlementRequest` 等数据模型；
@@ -45,10 +48,12 @@ from .errors import (
 from .models import (
     AuditEvent,
     BatchPreviewResult,
+    BatchRetryConflictResult,
     BatchSettlementResult,
     Creditor,
     CreditorAttribution,
     CurrencyAuditSummary,
+    InvalidBatchIdentifierResult,
     MulticurrencyBatchResult,
     MulticurrencyBatchPreviewResult,
     OutstandingBadDebt,
@@ -71,6 +76,8 @@ __all__ = [
     "SettlementRequest",
     "SettlementResult",
     "BatchSettlementResult",
+    "BatchRetryConflictResult",
+    "InvalidBatchIdentifierResult",
     "SettlementPreview",
     "BatchPreviewResult",
     "RiskGroupUsage",

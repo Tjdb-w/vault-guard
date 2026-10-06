@@ -95,6 +95,47 @@ batch = engine.process_batch(
 模块级 `vault_guard.process_settlement_batch(currency,
 opening_pool_balance, requests)` 使用一次性引擎返回结果，不跨批次去重。
 
+### 批次重试与断点恢复
+
+`ClearingEngine.process_batch_with_retry(batch_id, execution_id, currency,
+opening_pool_balance, requests)` 为已进入清算处理的批次补充可重复执行与
+失败恢复语义；清算输入、金额精度、限额命中口径、清偿顺序、坏账归属与
+审计记录完全沿用 `process_batch`：
+
+```python
+batch = engine.process_batch_with_retry(
+    "BATCH-2026-001",            # 稳定批次标识，跨重试不变
+    "EXEC-1",                    # 本次执行标识，每次执行可不同
+    "USD", Decimal("100"), requests,
+)
+```
+
+- 系统先检查该批次是否处理过，再按现有入口依次完成限额校验、清算
+  瀑布、坏账归因与审计记账；首次成功时输出原有
+  `BatchSettlementResult`。
+- 相同批次标识配相同请求内容时，无论执行标识是否相同，都返回与首次
+  完全相同的清算结果与审计内容：不重复扣减、不重复归因、不重复追加
+  审计记录。请求内容按引擎消费的字段判定，等价数值写法（如 `40`、
+  `40.0`、`Decimal("40.00")`）视为相同内容。
+- 处理中断后再次提交相同请求，从尚未完成的步骤继续；已完成步骤不再
+  产生副作用，调用方不会得到两套金额分配或两条等价审计轨迹。
+- 相同批次标识配不同请求内容时，在产生任何资金或审计副作用之前返回
+  唯一的 `BatchRetryConflictResult`（不可变），可观察到原批次标识
+  `batch_id`、原请求摘要 `original_request_digest` 与本次请求摘要
+  `incoming_request_digest`。
+- 缺少批次标识或执行标识、标识为空白、或请求摘要无法计算时，在产生
+  任何副作用之前返回唯一的 `InvalidBatchIdentifierResult`（不可变），
+  `reason` 取值 `MISSING_OR_EMPTY_BATCH_ID` /
+  `MISSING_OR_EMPTY_EXECUTION_ID` / `REQUEST_DIGEST_UNCOMPUTABLE`。
+- 并发提交同一批次时只允许一个请求推进处理，其他请求等待后取得同一
+  最终结果。
+- 既有口径不变：整体校验异常（空批次、缺币种、混合币种、重复流水号、
+  空债权清单、系数越界、非法数值）仍按原类型抛出；限额拒绝、金额不
+  足等业务结果仍使用原有结构，两种新拒绝结果不混入这些既有结果。
+  校验失败不登记批次标识，修正后可用同一批次标识重新提交。
+
+批次重试依赖引擎内的批次登记状态，仅提供引擎方法，无模块级一次性入口。
+
 ### 提交前只读预演
 
 三个预演入口分别与对应的正式批次入口使用相同的输入、校验顺序、异常类型、

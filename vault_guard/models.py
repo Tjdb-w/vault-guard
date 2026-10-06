@@ -26,6 +26,8 @@ __all__ = [
     "OutstandingBadDebt",
     "CurrencyAuditSummary",
     "AuditEvent",
+    "BatchRetryConflictResult",
+    "InvalidBatchIdentifierResult",
 ]
 
 
@@ -344,6 +346,38 @@ class CurrencyAuditSummary:
     outstanding_bad_debt: Decimal
     rejection_counts: Mapping[str, int]
     event_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class BatchRetryConflictResult:
+    """相同批次标识配不同请求内容时的唯一拒绝结果（不可变）。
+
+    批次重试入口在产生任何资金或审计副作用之前返回本结果；可观察到
+    原批次标识、原请求摘要与本次请求摘要。本结果不是
+    :class:`SettlementResult`，也不使用既有拒绝原因码口径。
+    """
+
+    batch_id: str
+    original_request_digest: str
+    incoming_request_digest: str
+
+
+@dataclass(frozen=True)
+class InvalidBatchIdentifierResult:
+    """批次标识无效时的唯一拒绝结果（不可变）。
+
+    缺少批次标识或执行标识、标识为空白、或请求摘要无法计算时，批次
+    重试入口在产生任何资金或审计副作用之前返回本结果。``reason``
+    区分三种情形：
+
+    - ``MISSING_OR_EMPTY_BATCH_ID``：批次标识缺失或为空白；
+    - ``MISSING_OR_EMPTY_EXECUTION_ID``：执行标识缺失或为空白；
+    - ``REQUEST_DIGEST_UNCOMPUTABLE``：请求内容无法归一化为摘要。
+    """
+
+    reason: str
+    batch_id: object = None
+    execution_id: object = None
 
 
 @dataclass(frozen=True)

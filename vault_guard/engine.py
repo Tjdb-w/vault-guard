@@ -18,6 +18,17 @@
 流水号、不改余额并回退批内状态；校验通过后逐笔限额校验与清算，通过请求
 各追加一条现有结构事件，批次本身不建事件。
 
+批次重试与断点恢复（:meth:`ClearingEngine.process_batch_with_retry`）在
+既有批次规则之上为已进入清算处理的批次补充可重复执行语义：调用方提供稳定
+批次标识与本次执行标识，相同批次标识配相同请求内容时无论执行标识是否相同
+都返回与首次完全相同的清算结果（不重复扣减、不重复归因、不重复追加审计
+记录）；处理中断后重提从尚未完成的步骤继续，已完成步骤不再产生副作用；
+相同批次标识配不同请求内容时在产生任何副作用之前返回唯一的
+:class:`~vault_guard.models.BatchRetryConflictResult`；标识缺失 / 为空或
+请求摘要无法计算时返回唯一的
+:class:`~vault_guard.models.InvalidBatchIdentifierResult`。并发提交同一
+批次时只允许一个请求推进，其余等待后取得同一最终结果。
+
 提交前预演（:meth:`ClearingEngine.preview_batch`）以相同输入、校验顺序与
 清算规则对同币种批次做只读预演：返回逐笔 :class:`SettlementPreview`（除无
 ``event_id`` 外与 :class:`SettlementResult` 同名字段同义）与最终余额，不
@@ -56,9 +67,11 @@
 """
 
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from decimal import Decimal, InvalidOperation
+import hashlib
 from math import isfinite
+import threading
 from types import MappingProxyType
 from typing import Union
 
@@ -76,10 +89,12 @@ from .errors import (
 from .models import (
     AuditEvent,
     BatchPreviewResult,
+    BatchRetryConflictResult,
     BatchSettlementResult,
     Creditor,
     CreditorAttribution,
     CurrencyAuditSummary,
+    InvalidBatchIdentifierResult,
     MulticurrencyBatchResult,
     MulticurrencyBatchPreviewResult,
     OutstandingBadDebt,
@@ -118,6 +133,31 @@ class _BadDebtEntry:
     creditor: str
     currency: str
     remaining: Decimal
+
+
+@dataclass
+class _RetryableBatchRecord:
+    """可重试批次的内部记录（引擎私有，可变）。
+
+    按批次标识登记请求内容摘要与执行进度：``completed`` 为已完成单笔
+    清算的请求数，``balance`` 为已完成步骤后的滚动余额；中断时保留
+    已完成步骤的全部状态，重提时从下一笔继续。``status`` 取值
+    ``in_progress`` / ``interrupted`` / ``completed``。
+    """
+
+    batch_id: str
+    digest: str
+    execution_id: str
+    normalized: list
+    balance: Decimal
+    results: list = field(default_factory=list)
+    completed: int = 0
+    status: str = "in_progress"
+    final: BatchSettlementResult | None = None
+
+
+class _DigestUncomputableError(Exception):
+    """请求内容无法归一化为确定摘要（引擎私有）。"""
 
 
 def _as_decimal(value: object, field: str) -> Decimal:
@@ -167,6 +207,9 @@ class ClearingEngine:
         # 存续坏账台账（按事件顺序追加）与已登记回收结果。
         self._bad_debt_ledger: list[_BadDebtEntry] = []
         self._recoveries: dict[str, RecoveryResult] = {}
+        # 可重试批次登记（批次标识 -> 进度记录）与并发串行化锁。
+        self._batch_records: dict[str, _RetryableBatchRecord] = {}
+        self._batch_retry_lock = threading.Lock()
 
     # ------------------------------------------------------------------ #
     # 只读查询（不触发清算，不改变任何状态）
@@ -404,6 +447,288 @@ class ClearingEngine:
             results=tuple(results),
             event_ids=tuple(result.event_id for result in results),
             validated_available_balance=balance,
+        )
+
+    def process_batch_with_retry(
+        self,
+        batch_id: str,
+        execution_id: str,
+        currency: str,
+        opening_pool_balance: Number,
+        requests: Iterable[Mapping[str, object]],
+    ) -> BatchSettlementResult | BatchRetryConflictResult | InvalidBatchIdentifierResult:
+        """按稳定批次标识处理同币种多笔结算批次，支持重试与断点恢复。
+
+        - ``batch_id``：调用方提供的稳定批次标识，跨重试保持不变。
+        - ``execution_id``：本次执行标识，每次执行可不同。
+        - ``currency`` / ``opening_pool_balance`` / ``requests``：语义、
+          金额精度与校验顺序完全沿用 :meth:`process_batch`。
+
+        处理语义：
+
+        - 缺少批次标识或执行标识、标识为空白，或请求摘要无法计算时，
+          在产生任何资金或审计副作用之前返回唯一的
+          :class:`InvalidBatchIdentifierResult`（``reason`` 区分情形）。
+        - 相同批次标识配不同请求内容时，在产生任何资金或审计副作用之前
+          返回唯一的 :class:`BatchRetryConflictResult`，可观察到原批次
+          标识、原请求摘要与本次请求摘要。
+        - 首次执行按现有入口依次完成限额校验、清算瀑布、坏账归因与审计
+          记账，成功时输出原有 :class:`BatchSettlementResult`。
+        - 后续以相同请求内容重试（无论执行标识是否相同）返回与首次完全
+          相同的清算结果：不重复扣减、不重复归因、不重复追加审计记录。
+        - 处理中断后再次提交相同请求，从尚未完成的步骤继续；已完成步骤
+          不再次产生副作用，调用方不会得到两套金额分配或两条等价审计
+          轨迹。
+        - 并发提交同一批次时只允许一个请求推进处理，其他请求等待后取得
+          同一最终结果。
+
+        既有失败口径不变：整体校验异常（空批次、缺币种、混合币种、重复
+        流水号、空债权清单、系数越界、非法数值）仍按原类型抛出；限额
+        拒绝、金额不足等业务结果仍使用原有结构，新拒绝结果不混入其中。
+        """
+        if not isinstance(batch_id, str) or not batch_id.strip():
+            return InvalidBatchIdentifierResult(
+                reason="MISSING_OR_EMPTY_BATCH_ID",
+                batch_id=batch_id,
+                execution_id=execution_id,
+            )
+        if not isinstance(execution_id, str) or not execution_id.strip():
+            return InvalidBatchIdentifierResult(
+                reason="MISSING_OR_EMPTY_EXECUTION_ID",
+                batch_id=batch_id,
+                execution_id=execution_id,
+            )
+
+        # 请求清单在此物化一次，供摘要计算与整体校验共用；缺失或不可
+        # 迭代时请求摘要无法计算。
+        try:
+            items = list(requests) if requests is not None else None
+        except TypeError:
+            items = None
+        if items is None:
+            return InvalidBatchIdentifierResult(
+                reason="REQUEST_DIGEST_UNCOMPUTABLE",
+                batch_id=batch_id,
+                execution_id=execution_id,
+            )
+
+        digest = self._compute_batch_digest(
+            currency, opening_pool_balance, items
+        )
+        if digest is None:
+            return InvalidBatchIdentifierResult(
+                reason="REQUEST_DIGEST_UNCOMPUTABLE",
+                batch_id=batch_id,
+                execution_id=execution_id,
+            )
+
+        # 同一批次并发提交时只允许一个请求推进；其余请求在锁上等待，
+        # 随后取得同一最终结果。
+        with self._batch_retry_lock:
+            record = self._batch_records.get(batch_id)
+            if record is not None and record.digest != digest:
+                return BatchRetryConflictResult(
+                    batch_id=batch_id,
+                    original_request_digest=record.digest,
+                    incoming_request_digest=digest,
+                )
+            if record is None:
+                # 整体校验沿用既有口径；校验失败不登记批次、不留任何状态。
+                _, opening, normalized = self._validate_batch(
+                    currency, opening_pool_balance, items
+                )
+                record = _RetryableBatchRecord(
+                    batch_id=batch_id,
+                    digest=digest,
+                    execution_id=execution_id,
+                    normalized=normalized,
+                    balance=opening,
+                )
+                self._batch_records[batch_id] = record
+
+            if record.status == "completed":
+                return record.final
+
+            # 断点恢复：从尚未完成的步骤继续，已完成步骤不再产生副作用；
+            # 中断时保留已完成步骤的全部状态，不回滚、不重复扣减。
+            try:
+                while record.completed < len(record.normalized):
+                    request = replace(
+                        record.normalized[record.completed],
+                        pool_balance=record.balance,
+                    )
+                    result = self._execute(request)
+                    # 执行成功后才登记流水号：中断步骤不占流水号。
+                    self._seen_transactions.add(request.transaction_id)
+                    record.results.append(result)
+                    record.balance = result.validated_available_balance
+                    record.completed += 1
+            except Exception:
+                record.status = "interrupted"
+                raise
+
+            record.status = "completed"
+            record.final = BatchSettlementResult(
+                results=tuple(record.results),
+                event_ids=tuple(r.event_id for r in record.results),
+                validated_available_balance=record.balance,
+            )
+            return record.final
+
+    # ------------------------------------------------------------------ #
+    # 批次请求摘要（重试一致性判定；无法归一化时视为摘要不可计算）
+    # ------------------------------------------------------------------ #
+
+    @classmethod
+    def _compute_batch_digest(
+        cls,
+        currency: object,
+        opening_pool_balance: object,
+        requests: object,
+    ) -> str | None:
+        """计算批次请求内容的确定摘要；无法归一化时返回 ``None``。
+
+        摘要只覆盖引擎实际消费的字段：批次币种、期初余额与逐请求的
+        流水号、金额字段（缺省 ``supplementary_capital`` 按 0 计）及
+        债权清单；数值按引擎同一归一化规则（``float`` 经字符串形式
+        转换）取规范文本，因此等价数值的不同写法得到相同摘要。币种
+        缺失或非法时做宽松规范化，由后续整体校验按既有口径抛出
+        :class:`InvalidCurrencyError`。
+        """
+        try:
+            opening = _as_decimal(opening_pool_balance, "opening_pool_balance")
+            if requests is None:
+                raise _DigestUncomputableError("批次请求清单缺失")
+            items = list(requests)
+        except (TypeError, ValueError, _DigestUncomputableError):
+            return None
+
+        if isinstance(currency, str):
+            currency_text = currency.strip()
+        else:
+            currency_text = f"!invalid:{type(currency).__name__}"
+        parts = [
+            f"currency={currency_text}",
+            f"opening_pool_balance={cls._canonical_decimal_text(opening)}",
+        ]
+        try:
+            for index, item in enumerate(items):
+                parts.append(cls._canonical_batch_item_text(item, index))
+        except _DigestUncomputableError:
+            return None
+        canonical = "\n".join(parts)
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _canonical_decimal_text(value: Decimal) -> str:
+        """数值的规范文本：等价数值（含 ``-0`` 与 ``0``）得到相同文本。"""
+        if value == _ZERO:
+            value = _ZERO
+        return str(value.normalize())
+
+    @classmethod
+    def _canonical_batch_item_text(cls, item: object, index: int) -> str:
+        """单个批次请求映射的规范文本；结构或数值无法归一化时抛
+        :class:`_DigestUncomputableError`。"""
+        if not isinstance(item, Mapping):
+            raise _DigestUncomputableError(
+                f"requests[{index}] 必须是字段映射"
+            )
+        transaction_id = item.get("transaction_id")
+        if not isinstance(transaction_id, str) or not transaction_id.strip():
+            raise _DigestUncomputableError(
+                f"requests[{index}].transaction_id 必须是非空字符串"
+            )
+
+        fields: list[str] = []
+        for key, default in (
+            ("settlement_amount", None),
+            ("notional_exposure", None),
+            ("base_limit", None),
+            ("risk_factor", None),
+            ("supplementary_capital", _ZERO),
+        ):
+            raw = item.get(key, default)
+            try:
+                value = _as_decimal(raw, f"requests[{index}].{key}")
+            except ValueError:
+                raise _DigestUncomputableError(
+                    f"requests[{index}].{key} 无法归一化为数值"
+                ) from None
+            fields.append(f"{key}={cls._canonical_decimal_text(value)}")
+
+        # 债权清单缺失或不可迭代时与引擎一致视为空清单，由后续整体校验
+        # 按既有口径抛出 EmptyCreditorListError。
+        creditors_text: list[str] = []
+        raw_creditors = item.get("creditors")
+        try:
+            creditor_items = (
+                list(raw_creditors) if raw_creditors is not None else []
+            )
+        except TypeError:
+            creditor_items = []
+        for creditor_index, creditor_item in enumerate(creditor_items):
+            creditors_text.append(
+                cls._canonical_creditor_text(
+                    creditor_item, index, creditor_index
+                )
+            )
+
+        return (
+            f"requests[{index}]("
+            f"transaction_id={transaction_id};"
+            + ";".join(fields)
+            + f";creditors=[{','.join(creditors_text)}])"
+        )
+
+    @classmethod
+    def _canonical_creditor_text(
+        cls, item: object, index: int, creditor_index: int
+    ) -> str:
+        """单项债权的规范文本 ``(name, amount, currency)``。"""
+        if isinstance(item, Creditor):
+            name, claim, ccy = item.name, item.amount, item.currency
+        elif isinstance(item, Mapping):
+            name = item.get("name")
+            claim = item.get("amount")
+            ccy = item.get("currency")
+        elif isinstance(item, tuple):
+            if len(item) == 2:
+                name, claim = item
+                ccy = None
+            elif len(item) == 3:
+                name, claim, ccy = item
+            else:
+                raise _DigestUncomputableError(
+                    f"requests[{index}] 第 {creditor_index} 项债权元组长度非法"
+                )
+        else:
+            raise _DigestUncomputableError(
+                f"requests[{index}] 第 {creditor_index} 项债权格式不被支持"
+            )
+
+        if not isinstance(name, str) or not name.strip():
+            raise _DigestUncomputableError(
+                f"requests[{index}] 第 {creditor_index} 项债权缺少有效名称"
+            )
+        try:
+            claim_dec = _as_decimal(
+                claim, f"requests[{index}].creditors[{creditor_index}].amount"
+            )
+        except ValueError:
+            raise _DigestUncomputableError(
+                f"requests[{index}] 第 {creditor_index} 项债权金额无法归一化"
+            ) from None
+        if ccy is not None:
+            if not isinstance(ccy, str):
+                raise _DigestUncomputableError(
+                    f"requests[{index}] 第 {creditor_index} 项债权币种非法"
+                )
+            ccy = ccy.strip()
+        return (
+            f"({name.strip()},"
+            f"{cls._canonical_decimal_text(claim_dec)},"
+            f"{ccy})"
         )
 
     def preview_batch(
