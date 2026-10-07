@@ -401,6 +401,39 @@ trail = engine.bad_debt_trail("TX-001")
   不改台账、结果索引、风险组额度、资金池或坏账状态，不落盘、不换汇、
   不估时。
 
+## 风险组坏账责任报告
+
+`ClearingEngine.risk_group_bad_debt_report(currency)` 汇总该币种携带
+`risk_group_id` 的结算及其坏账处理记录（无风险组记录不参与），按风险组
+标识字典序返回不可变的 `RiskGroupBadDebtSummary` 元组（金额为
+`Decimal`，计数为 `int`）：
+
+```python
+rows = engine.risk_group_bad_debt_report("USD")
+```
+
+| 字段 | 含义 |
+| --- | --- |
+| `risk_group_id` | 风险组标识 |
+| `settlement_count` / `approved_count` / `rejected_count` | 组内结算事件总数与放行 / 拒绝数 |
+| `risk_occupancy` | 仅放行请求的风险占用合计；拒绝仅计数 |
+| `initial_bad_debt` | 组内放行归因坏账（大于零者）合计 |
+| `recovered_amount` / `written_off_amount` | 按来源结算回溯本组的回收 / 核销（含定向操作）合计；空明细零额操作不计 |
+| `outstanding_bad_debt` | 首次坏账 − 回收 − 核销，与组内各来源在 `outstanding_bad_debts` 中的余额合计一致 |
+| `source_transaction_ids` | 放行归因坏账大于零的来源结算流水号，按首次出现顺序去重 |
+| `recovery_transaction_ids` / `writeoff_transaction_ids` | 实际归属本组的回收 / 核销流水号，按首次出现顺序去重 |
+| `creditor_summaries` | 组内按债权人名称字典序排列的 `CreditorBadDebtSummary` 元组，口径同债权人报告 |
+
+- **恒等式**：每组 `initial_bad_debt - recovered_amount
+  - written_off_amount == outstanding_bad_debt`；组内各债权人存续坏账
+  之和等于该组 `outstanding_bad_debt`；该币种坏账全部来自带风险组的
+  结算时，各组存续之和等于 `outstanding_bad_debts(currency)` 余额合计。
+- **空结果**：空台账、币种不存在或该币种仅有无风险组记录时返回空元组。
+- **校验**：`currency` 非字符串或去首尾空白后为空抛
+  `InvalidCurrencyError`，匹配时去除首尾空白。
+- **只读**：重复调用结果确定，不新增事件、不占序号与流水号、不改结果
+  索引、风险组额度、资金池与坏账状态，不落盘、不换汇、不估时。
+
 ## 返回结构
 
 成功与拒绝路径使用同构的 `SettlementResult`：
@@ -450,6 +483,7 @@ trail = engine.bad_debt_trail("TX-001")
   `engine.audit_reconciliation(currency)`、
   `engine.creditor_bad_debt_report(currency, creditor_names=None)`、
   `engine.bad_debt_trail(transaction_id)`、
+  `engine.risk_group_bad_debt_report(currency)`、
   `engine.has_transaction(transaction_id)`。
 
 ### 单币种审计核对快照

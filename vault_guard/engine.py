@@ -90,6 +90,18 @@ outstanding_bad_debt``（与 :meth:`outstanding_bad_debts` 该债权人余额
 :meth:`outstanding_bad_debts` 同来源余额合计一致。查询不新增事件、不占
 流水号、不改任何状态。
 
+风险组坏账责任报告（:meth:`ClearingEngine.risk_group_bad_debt_report`）
+是只读查询：汇总该币种携带 ``risk_group_id`` 的结算（无风险组记录不参
+与），按风险组标识字典序返回不可变 :class:`RiskGroupBadDebtSummary`
+元组。每组给出结算 / 放行 / 拒绝计数、仅放行累计的风险占用、首次坏账、
+回溯来源风险组与债权人的回收 / 核销（含定向操作，空明细不计）与存续
+坏账，三类流水号按首次出现顺序去重（来源仅含放行坏账大于零者）；
+``creditor_summaries`` 口径同债权人报告并按债权人名称字典序排列。
+每组恒满足 ``initial_bad_debt - recovered_amount - written_off_amount
+== outstanding_bad_debt``，组内债权人存续坏账之和等于该组值。空台账、
+币种不存在或仅无风险组记录时返回空元组；查询不新增事件、不占序号或
+流水号、不改任何状态。
+
 批次重试与断点恢复（:meth:`ClearingEngine.process_batch_retry` /
 :meth:`ClearingEngine.process_risk_group_batch_retry` /
 :meth:`ClearingEngine.process_multicurrency_batch_retry`）在既有三类批次
@@ -150,6 +162,7 @@ from .models import (
     RecoveryResult,
     RiskGroupBatchResult,
     RiskGroupBatchPreviewResult,
+    RiskGroupBadDebtSummary,
     RiskGroupUsage,
     SettlementPreview,
     SettlementRequest,
@@ -215,6 +228,59 @@ class _CreditorBadDebtAggregate:
         if transaction_id not in self.writeoff_transaction_ids:
             self.writeoff_transaction_ids.append(transaction_id)
         self.written_off_amount += amount
+
+
+@dataclass
+class _RiskGroupBadDebtAggregate:
+    """单个风险组的坏账责任汇总累加器（引擎私有，可变）。
+
+    三类流水号在追加时按首次出现顺序去重；``risk_occupancy`` 只累计放行
+    请求，拒绝仅计数；组内债权人累加器仅在放行归因坏账大于零时创建，
+    回收 / 核销按来源结算流水号回溯本组后累加到对应债权人。
+    """
+
+    risk_group_id: str
+    settlement_count: int = 0
+    approved_count: int = 0
+    rejected_count: int = 0
+    risk_occupancy: Decimal = _ZERO
+    source_transaction_ids: list[str] = field(default_factory=list)
+    recovery_transaction_ids: list[str] = field(default_factory=list)
+    writeoff_transaction_ids: list[str] = field(default_factory=list)
+    creditors: dict[str, _CreditorBadDebtAggregate] = field(
+        default_factory=dict
+    )
+
+    def add_source(
+        self, transaction_id: str, creditor: str, amount: Decimal
+    ) -> None:
+        if transaction_id not in self.source_transaction_ids:
+            self.source_transaction_ids.append(transaction_id)
+        aggregate = self.creditors.get(creditor)
+        if aggregate is None:
+            aggregate = _CreditorBadDebtAggregate(creditor=creditor)
+            self.creditors[creditor] = aggregate
+        aggregate.add_source(transaction_id, amount)
+
+    def add_recovery(
+        self, transaction_id: str, creditor: str, amount: Decimal
+    ) -> None:
+        aggregate = self.creditors.get(creditor)
+        if aggregate is None:
+            return
+        if transaction_id not in self.recovery_transaction_ids:
+            self.recovery_transaction_ids.append(transaction_id)
+        aggregate.add_recovery(transaction_id, amount)
+
+    def add_writeoff(
+        self, transaction_id: str, creditor: str, amount: Decimal
+    ) -> None:
+        aggregate = self.creditors.get(creditor)
+        if aggregate is None:
+            return
+        if transaction_id not in self.writeoff_transaction_ids:
+            self.writeoff_transaction_ids.append(transaction_id)
+        aggregate.add_writeoff(transaction_id, amount)
 
 
 @dataclass
@@ -371,7 +437,8 @@ class ClearingEngine:
     （:meth:`get_event` / :meth:`events` / :meth:`result_of` /
     :meth:`recovery_of` / :meth:`writeoff_of` /
     :meth:`outstanding_bad_debts` / :meth:`audit_reconciliation` /
-    :meth:`creditor_bad_debt_report` / :meth:`bad_debt_trail`）不触发清算。
+    :meth:`creditor_bad_debt_report` / :meth:`bad_debt_trail` /
+    :meth:`risk_group_bad_debt_report`）不触发清算。
     """
 
     def __init__(self) -> None:
@@ -382,6 +449,8 @@ class ClearingEngine:
         # 风险组登记上限与累计已用额度，跨批次保留。
         self._risk_group_limits: dict[str, Decimal] = {}
         self._risk_group_used: dict[str, Decimal] = {}
+        # 结算流水号 -> 风险组标识（仅带组的结算；供风险组报告回溯）。
+        self._settlement_risk_groups: dict[str, str] = {}
         # 存续坏账台账（按事件顺序追加）与已登记回收 / 核销结果。
         self._bad_debt_ledger: list[_BadDebtEntry] = []
         self._recoveries: dict[str, RecoveryResult] = {}
@@ -767,6 +836,181 @@ class ClearingEngine:
             writeoffs=tuple(writeoffs),
         )
 
+    def risk_group_bad_debt_report(
+        self, currency: str
+    ) -> tuple[RiskGroupBadDebtSummary, ...]:
+        """返回该币种按风险组划分的只读坏账责任报告（不可变元组）。
+
+        汇总该币种下携带 ``risk_group_id`` 的结算事件（不带风险组的记录
+        不参与），按 ``risk_group_id`` 字典序返回
+        :class:`RiskGroupBadDebtSummary` 元组。每组内：
+
+        - ``settlement_count`` 统计组内全部结算事件，``approved_count`` /
+          ``rejected_count`` 分别计放行 / 拒绝；``risk_occupancy`` 只累计
+          放行请求，拒绝仅计数。
+        - ``initial_bad_debt`` 按放行归因（``bad_debt > 0``）求和；
+          ``recovered_amount`` / ``written_off_amount`` 由回收、核销及
+          定向操作按明细的来源结算流水号回溯来源风险组与债权人后求和；
+          空明细的零额操作不计入。
+        - 三类流水号按首次出现顺序去重；``source_transaction_ids`` 仅含
+          放行归因坏账大于零的结算。
+        - ``creditor_summaries`` 口径同 :meth:`creditor_bad_debt_report`，
+          按债权人名称字典序排列，仅合并来源属于本组的坏账记录。
+
+        每组恒满足 ``initial_bad_debt - recovered_amount
+        - written_off_amount == outstanding_bad_debt``，组内各债权人存续
+        坏账之和等于该组 ``outstanding_bad_debt``；当该币种坏账全部来自
+        带风险组的结算时，各组存续坏账之和等于
+        :meth:`outstanding_bad_debts` 该币种余额合计。
+
+        ``currency`` 非字符串或去首尾空白后为空抛
+        :class:`InvalidCurrencyError`，匹配时去除首尾空白。空台账、币种
+        不存在或该币种仅有无风险组记录时返回空元组。查询只读且可重复：
+        不新增事件、不占审计序号或流水号、不改结果索引、风险组额度、
+        资金池与坏账状态，不落盘、不换汇、不估时。
+        """
+        if not isinstance(currency, str) or not currency.strip():
+            raise InvalidCurrencyError("账户币种缺失或为空")
+        currency = currency.strip()
+
+        # 按审计事件顺序累加；回收 / 核销明细经来源结算流水号回溯风险组。
+        aggregates: dict[str, _RiskGroupBadDebtAggregate] = {}
+
+        for event in self._events:
+            if event.currency != currency:
+                continue
+            if event.validation_result == "RECOVERY":
+                for source_id, creditor, amount, _remaining in (
+                    event.recovery_allocations
+                ):
+                    group_id = self._settlement_risk_groups.get(source_id)
+                    if group_id is None:
+                        continue
+                    aggregate = aggregates.get(group_id)
+                    if aggregate is not None:
+                        aggregate.add_recovery(
+                            event.transaction_id, creditor, amount
+                        )
+                continue
+            if event.validation_result == "WRITEOFF":
+                for source_id, creditor, amount, _remaining in (
+                    event.writeoff_allocations
+                ):
+                    group_id = self._settlement_risk_groups.get(source_id)
+                    if group_id is None:
+                        continue
+                    aggregate = aggregates.get(group_id)
+                    if aggregate is not None:
+                        aggregate.add_writeoff(
+                            event.transaction_id, creditor, amount
+                        )
+                continue
+
+            group_id = self._settlement_risk_groups.get(event.transaction_id)
+            if group_id is None:
+                # 无风险组的结算记录不参与本报告。
+                continue
+            aggregate = aggregates.get(group_id)
+            if aggregate is None:
+                aggregate = _RiskGroupBadDebtAggregate(risk_group_id=group_id)
+                aggregates[group_id] = aggregate
+            aggregate.settlement_count += 1
+            if not event.approved:
+                # 拒绝路径不确认坏账、不累计风险占用，仅计数。
+                aggregate.rejected_count += 1
+                continue
+            aggregate.approved_count += 1
+            aggregate.risk_occupancy += event.risk_occupancy
+            result = self._results.get(event.transaction_id)
+            if result is None:
+                continue
+            for attribution in result.attributions:
+                if attribution.bad_debt <= _ZERO:
+                    continue
+                aggregate.add_source(
+                    event.transaction_id,
+                    attribution.creditor,
+                    attribution.bad_debt,
+                )
+
+        # 存续余额按 (风险组, 债权人) 汇总（只可能命中已在 aggregates 中
+        # 的组与债权人）。
+        outstanding_by_pair: dict[tuple[str, str], Decimal] = {}
+        for entry in self._bad_debt_ledger:
+            if entry.currency != currency or entry.remaining <= _ZERO:
+                continue
+            group_id = self._settlement_risk_groups.get(
+                entry.source_transaction_id
+            )
+            if group_id is None:
+                continue
+            key = (group_id, entry.creditor)
+            outstanding_by_pair[key] = (
+                outstanding_by_pair.get(key, _ZERO) + entry.remaining
+            )
+
+        rows: list[RiskGroupBadDebtSummary] = []
+        for group_id in sorted(aggregates):
+            aggregate = aggregates[group_id]
+            creditor_rows: list[CreditorBadDebtSummary] = []
+            initial_bad_debt = _ZERO
+            recovered_amount = _ZERO
+            written_off_amount = _ZERO
+            outstanding_bad_debt = _ZERO
+            for creditor in sorted(aggregate.creditors):
+                creditor_aggregate = aggregate.creditors[creditor]
+                outstanding = outstanding_by_pair.get(
+                    (group_id, creditor), _ZERO
+                )
+                creditor_rows.append(
+                    CreditorBadDebtSummary(
+                        creditor=creditor,
+                        source_transaction_ids=tuple(
+                            creditor_aggregate.source_transaction_ids
+                        ),
+                        recovery_transaction_ids=tuple(
+                            creditor_aggregate.recovery_transaction_ids
+                        ),
+                        writeoff_transaction_ids=tuple(
+                            creditor_aggregate.writeoff_transaction_ids
+                        ),
+                        initial_bad_debt=creditor_aggregate.initial_bad_debt,
+                        recovered_amount=creditor_aggregate.recovered_amount,
+                        written_off_amount=(
+                            creditor_aggregate.written_off_amount
+                        ),
+                        outstanding_bad_debt=outstanding,
+                    )
+                )
+                initial_bad_debt += creditor_aggregate.initial_bad_debt
+                recovered_amount += creditor_aggregate.recovered_amount
+                written_off_amount += creditor_aggregate.written_off_amount
+                outstanding_bad_debt += outstanding
+            rows.append(
+                RiskGroupBadDebtSummary(
+                    risk_group_id=group_id,
+                    settlement_count=aggregate.settlement_count,
+                    approved_count=aggregate.approved_count,
+                    rejected_count=aggregate.rejected_count,
+                    risk_occupancy=aggregate.risk_occupancy,
+                    initial_bad_debt=initial_bad_debt,
+                    recovered_amount=recovered_amount,
+                    written_off_amount=written_off_amount,
+                    outstanding_bad_debt=outstanding_bad_debt,
+                    source_transaction_ids=tuple(
+                        aggregate.source_transaction_ids
+                    ),
+                    recovery_transaction_ids=tuple(
+                        aggregate.recovery_transaction_ids
+                    ),
+                    writeoff_transaction_ids=tuple(
+                        aggregate.writeoff_transaction_ids
+                    ),
+                    creditor_summaries=tuple(creditor_rows),
+                )
+            )
+        return tuple(rows)
+
     # ------------------------------------------------------------------ #
     # 公开入口
     # ------------------------------------------------------------------ #
@@ -859,6 +1103,7 @@ class ClearingEngine:
             for tid in added_ids:
                 self._seen_transactions.discard(tid)
                 self._results.pop(tid, None)
+                self._settlement_risk_groups.pop(tid, None)
             raise
 
         return BatchSettlementResult(
@@ -970,6 +1215,7 @@ class ClearingEngine:
             for tid in added_ids:
                 self._seen_transactions.discard(tid)
                 self._results.pop(tid, None)
+                self._settlement_risk_groups.pop(tid, None)
             raise
 
         return RiskGroupBatchResult(
@@ -1129,6 +1375,7 @@ class ClearingEngine:
             for tid in added_ids:
                 self._seen_transactions.discard(tid)
                 self._results.pop(tid, None)
+                self._settlement_risk_groups.pop(tid, None)
             raise
 
         return MulticurrencyBatchResult(
@@ -1519,6 +1766,7 @@ class ClearingEngine:
                 self._risk_group_used[group_id] = group_used_before
             self._seen_transactions.discard(tid)
             self._results.pop(tid, None)
+            self._settlement_risk_groups.pop(tid, None)
             raise
 
     def process_recovery(
@@ -2722,6 +2970,10 @@ class ClearingEngine:
         )
         self._events.append(event)
         self._results[request.transaction_id] = result
+        if request.risk_group_id is not None:
+            self._settlement_risk_groups[request.transaction_id] = (
+                request.risk_group_id
+            )
         if result.approved:
             # 已放行结算的未覆盖债权进入存续坏账台账，供后续回收冲减；
             # 台账顺序即审计事件顺序 + 债权清单顺序。

@@ -28,6 +28,7 @@ __all__ = [
     "OutstandingBadDebt",
     "CurrencyAuditSummary",
     "CreditorBadDebtSummary",
+    "RiskGroupBadDebtSummary",
     "BadDebtOperation",
     "BadDebtTrail",
     "AuditEvent",
@@ -426,6 +427,46 @@ class CreditorBadDebtSummary(NamedTuple):
     recovered_amount: Decimal
     written_off_amount: Decimal
     outstanding_bad_debt: Decimal
+
+
+class RiskGroupBadDebtSummary(NamedTuple):
+    """单个风险组维度的坏账责任汇总（不可变，只读查询结果）。
+
+    汇总该币种下携带同一 ``risk_group_id`` 的结算及其坏账处理记录；
+    金额为 :class:`Decimal`，计数为 ``int``：
+
+    - ``risk_group_id``：风险组标识（与登记时一致）。
+    - ``settlement_count`` / ``approved_count`` / ``rejected_count``：
+      组内结算事件总数与放行 / 拒绝数。
+    - ``risk_occupancy``：仅放行请求的风险占用合计；拒绝仅计数。
+    - ``initial_bad_debt``：组内放行归因坏账（大于零者）合计。
+    - ``recovered_amount`` / ``written_off_amount``：按来源结算回溯
+      本组的回收 / 核销（含定向操作）冲减额合计；空明细零额操作不计。
+    - ``outstanding_bad_debt``：
+      ``initial_bad_debt - recovered_amount - written_off_amount``，
+      与组内各来源在 :meth:`ClearingEngine.outstanding_bad_debts` 中的
+      余额合计一致。
+    - ``source_transaction_ids`` / ``recovery_transaction_ids`` /
+      ``writeoff_transaction_ids``：三类流水号按首次出现顺序去重；
+      来源仅含放行归因坏账大于零的结算。
+    - ``creditor_summaries``：组内按债权人名称字典序排列的
+      :class:`CreditorBadDebtSummary` 元组，口径同债权人报告；组内
+      各债权人存续坏账之和等于本组 ``outstanding_bad_debt``。
+    """
+
+    risk_group_id: str
+    settlement_count: int
+    approved_count: int
+    rejected_count: int
+    risk_occupancy: Decimal
+    initial_bad_debt: Decimal
+    recovered_amount: Decimal
+    written_off_amount: Decimal
+    outstanding_bad_debt: Decimal
+    source_transaction_ids: tuple[str, ...]
+    recovery_transaction_ids: tuple[str, ...]
+    writeoff_transaction_ids: tuple[str, ...]
+    creditor_summaries: tuple[CreditorBadDebtSummary, ...]
 
 
 class BadDebtOperation(NamedTuple):

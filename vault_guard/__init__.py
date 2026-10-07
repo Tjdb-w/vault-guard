@@ -31,6 +31,10 @@
 - :meth:`ClearingEngine.bad_debt_trail`：按来源结算流水号串联坏账处理
   记录的只读轨迹入口（精确匹配已登记结算流水号，返回不可变
   :class:`~vault_guard.models.BadDebtTrail`，不新增事件、不改任何状态）；
+- :meth:`ClearingEngine.risk_group_bad_debt_report`：风险组维度只读坏账
+  责任报告入口（汇总带风险组的结算，按组标识字典序返回不可变
+  :class:`~vault_guard.models.RiskGroupBadDebtSummary` 元组，不新增事件、
+  不改任何状态）；
 - :meth:`ClearingEngine.process_batch_retry` /
   :meth:`ClearingEngine.process_risk_group_batch_retry` /
   :meth:`ClearingEngine.process_multicurrency_batch_retry`：已进入清算处理
@@ -85,6 +89,7 @@ from .models import (
     RecoveryResult,
     RiskGroupBatchResult,
     RiskGroupBatchPreviewResult,
+    RiskGroupBadDebtSummary,
     RiskGroupUsage,
     SettlementPreview,
     SettlementRequest,
@@ -107,6 +112,7 @@ __all__ = [
     "RiskGroupUsage",
     "RiskGroupBatchResult",
     "RiskGroupBatchPreviewResult",
+    "RiskGroupBadDebtSummary",
     "MulticurrencyBatchResult",
     "MulticurrencyBatchPreviewResult",
     "RecoveryAllocation",
