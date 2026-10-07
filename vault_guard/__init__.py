@@ -16,6 +16,10 @@
 - :meth:`ClearingEngine.process_multicurrency_batch` /
   :func:`process_settlement_multicurrency_batch`：按币种独立记账的多币种
   批次入口（不换汇、不使用汇率）；
+- :meth:`ClearingEngine.evaluate_settlement_batch` /
+  :func:`evaluate_settlement_batch`：清算批次组合限额预占与确定性试算
+  入口（资金方 / 付款方两层累计占额，只读、不写既有台账，不新增文件、
+  数据库表或消息约定）；
 - :meth:`ClearingEngine.process_recovery`：存续坏账回收入口（回收依赖台账
   状态，仅提供引擎方法，无模块级一次性入口）；
 - :meth:`ClearingEngine.process_writeoff`：存续坏账核销入口（核销依赖台账
@@ -47,21 +51,28 @@
 
 from .engine import (
     ClearingEngine,
+    evaluate_settlement_batch,
     process_settlement,
     process_settlement_batch,
     process_settlement_multicurrency_batch,
     process_settlement_risk_group_batch,
 )
 from .errors import (
+    CurrencyMismatchError,
+    DuplicateSettlementIdError,
     DuplicateTransactionError,
     EmptyBatchError,
     EmptyCreditorListError,
     InvalidCurrencyError,
     InvalidRiskFactorError,
     InvalidRiskGroupError,
+    InvalidSettlementAmountError,
+    InvalidSettlementBatchError,
+    InvalidSettlementPriorityError,
     MixedCurrencyError,
     NoOutstandingBadDebtError,
     RecoveryAmountExceedsOutstandingError,
+    RiskPolicyNotFoundError,
     VaultGuardError,
     WriteoffAmountExceedsOutstandingError,
 )
@@ -82,6 +93,8 @@ from .models import (
     CreditorAttribution,
     CreditorBadDebtSummary,
     CurrencyAuditSummary,
+    EvaluatedSettlement,
+    LimitReservation,
     MulticurrencyBatchResult,
     MulticurrencyBatchPreviewResult,
     OutstandingBadDebt,
@@ -91,9 +104,14 @@ from .models import (
     RiskGroupBatchPreviewResult,
     RiskGroupBadDebtSummary,
     RiskGroupUsage,
+    RiskPolicy,
+    SettlementBadDebtAttribution,
+    SettlementBatchEvaluation,
+    SettlementEvaluationAuditEvent,
     SettlementPreview,
     SettlementRequest,
     SettlementResult,
+    SettlementWaterfall,
     WriteoffAllocation,
     WriteoffResult,
 )
@@ -104,6 +122,7 @@ __all__ = [
     "process_settlement_batch",
     "process_settlement_risk_group_batch",
     "process_settlement_multicurrency_batch",
+    "evaluate_settlement_batch",
     "SettlementRequest",
     "SettlementResult",
     "BatchSettlementResult",
@@ -127,6 +146,13 @@ __all__ = [
     "BadDebtTrail",
     "CurrencyAuditSummary",
     "AuditEvent",
+    "RiskPolicy",
+    "LimitReservation",
+    "SettlementWaterfall",
+    "SettlementBadDebtAttribution",
+    "SettlementEvaluationAuditEvent",
+    "EvaluatedSettlement",
+    "SettlementBatchEvaluation",
     "BatchRetryConflict",
     "BatchIdentifierInvalid",
     "BATCH_OUTCOME_RETRY_CONFLICT",
@@ -142,6 +168,12 @@ __all__ = [
     "MixedCurrencyError",
     "EmptyBatchError",
     "InvalidRiskGroupError",
+    "InvalidSettlementBatchError",
+    "DuplicateSettlementIdError",
+    "RiskPolicyNotFoundError",
+    "CurrencyMismatchError",
+    "InvalidSettlementAmountError",
+    "InvalidSettlementPriorityError",
     "NoOutstandingBadDebtError",
     "RecoveryAmountExceedsOutstandingError",
     "WriteoffAmountExceedsOutstandingError",

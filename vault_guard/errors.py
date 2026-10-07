@@ -10,6 +10,13 @@
 - 混合币种 -> :class:`MixedCurrencyError`
 - 空批次 -> :class:`EmptyBatchError`
 - 风险组标识 / 限额错误 -> :class:`InvalidRiskGroupError`
+- 清算试算批次标识 / 币种 / 风险策略缺失 -> :class:`InvalidSettlementBatchError`
+- 清算试算批次内或已登记 settlement_id 重复 ->
+  :class:`DuplicateSettlementIdError`
+- 清算试算引用未登记风险策略 -> :class:`RiskPolicyNotFoundError`
+- 清算试算记录币种与批次币种不一致 -> :class:`CurrencyMismatchError`
+- 清算试算 amount 非有限正数 -> :class:`InvalidSettlementAmountError`
+- 清算试算 priority 非整数 -> :class:`InvalidSettlementPriorityError`
 - 回收币种无存续坏账 -> :class:`NoOutstandingBadDebtError`
 - 回收额超过存续坏账 -> :class:`RecoveryAmountExceedsOutstandingError`
 - 核销额超过存续坏账 -> :class:`WriteoffAmountExceedsOutstandingError`
@@ -24,6 +31,12 @@ __all__ = [
     "MixedCurrencyError",
     "EmptyBatchError",
     "InvalidRiskGroupError",
+    "InvalidSettlementBatchError",
+    "DuplicateSettlementIdError",
+    "RiskPolicyNotFoundError",
+    "CurrencyMismatchError",
+    "InvalidSettlementAmountError",
+    "InvalidSettlementPriorityError",
     "NoOutstandingBadDebtError",
     "RecoveryAmountExceedsOutstandingError",
     "WriteoffAmountExceedsOutstandingError",
@@ -60,6 +73,30 @@ class EmptyBatchError(VaultGuardError):
 
 class InvalidRiskGroupError(VaultGuardError):
     """风险组标识为空、引用未登记组、限额非法或同一引擎内上限不一致。"""
+
+
+class InvalidSettlementBatchError(VaultGuardError):
+    """清算试算批次缺少批次标识、币种或风险策略。"""
+
+
+class DuplicateSettlementIdError(VaultGuardError):
+    """清算试算批次内或与已登记记录出现重复 settlement_id。"""
+
+
+class RiskPolicyNotFoundError(VaultGuardError):
+    """清算试算记录引用了未在引擎登记的风险策略。"""
+
+
+class CurrencyMismatchError(VaultGuardError):
+    """清算试算记录的币种与批次币种不一致。"""
+
+
+class InvalidSettlementAmountError(VaultGuardError):
+    """清算试算记录的 amount 不是有限正数。"""
+
+
+class InvalidSettlementPriorityError(VaultGuardError):
+    """清算试算记录的 priority 不是整数。"""
 
 
 class NoOutstandingBadDebtError(VaultGuardError):

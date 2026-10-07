@@ -32,6 +32,13 @@ __all__ = [
     "BadDebtOperation",
     "BadDebtTrail",
     "AuditEvent",
+    "RiskPolicy",
+    "LimitReservation",
+    "SettlementWaterfall",
+    "EvaluatedSettlement",
+    "SettlementBadDebtAttribution",
+    "SettlementEvaluationAuditEvent",
+    "SettlementBatchEvaluation",
     "BatchRetryConflict",
     "BatchIdentifierInvalid",
     "BATCH_OUTCOME_RETRY_CONFLICT",
@@ -593,3 +600,163 @@ class BatchIdentifierInvalid:
     reason: str
     batch_id: str | None = None
     outcome: str = BATCH_OUTCOME_INVALID_IDENTIFIER
+
+
+# --------------------------------------------------------------------------- #
+# 清算批次组合限额预占与确定性试算（evaluate_settlement_batch）
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class RiskPolicy:
+    """登记到引擎、供清算试算引用的风险策略（不可变）。
+
+    - ``treasury_limit`` / ``debtor_limit``：资金方与付款方两层的非负组合
+      限额；记录只有在两层的「快照已占额 + 批内已受理额 + 本笔金额」都不
+      超过对应限额时才受理，边界取等号。
+    """
+
+    policy_id: str
+    treasury_limit: Decimal
+    debtor_limit: Decimal
+
+
+@dataclass(frozen=True)
+class LimitReservation:
+    """单条限额（资金方或付款方一层）在批次试算中的占额轨迹（不可变）。
+
+    - ``limit_key``：限额项标识；资金方层为 ``"treasury:<treasury_id>"``，
+      付款方层为 ``"debtor:<debtor_id>"``。
+    - ``layer``：限额层，``"treasury"`` 或 ``"debtor"``。
+    - ``party_id``：该层主体标识（资金方或付款方标识）。
+    - ``initial_reserved``：进入本批前调用方在占额快照中给出的已占额。
+    - ``accepted_reserved``：批内已受理记录在该层新增的占额合计。
+    - ``rejected_reserved``：被拒绝记录在该层的占额合计（恒为 0；拒绝不
+      预占、不影响任何限额）。
+    - ``final_reserved``：``initial_reserved + accepted_reserved``。
+    - ``limit``：风险策略登记的该层限额。
+    - ``remaining``：``limit - final_reserved``。
+    """
+
+    limit_key: str
+    layer: str
+    party_id: str
+    initial_reserved: Decimal
+    accepted_reserved: Decimal
+    rejected_reserved: Decimal
+    final_reserved: Decimal
+    limit: Decimal
+    remaining: Decimal
+
+
+@dataclass(frozen=True)
+class SettlementWaterfall:
+    """单笔受理记录的确定性清算瀑布（不可变）。
+
+    - ``creditor``：债权人名称。
+    - ``claim_amount``：该债权人债权金额。
+    - ``pool_allocation``：以受理金额为资金来源、按债权顺序受偿的池内分配。
+    - ``capital_allocation``：补充资本按债权顺序补足未偿部分的承担。
+    - ``bad_debt``：两层分配后仍未受偿的金额。
+    """
+
+    creditor: str
+    claim_amount: Decimal
+    pool_allocation: Decimal
+    capital_allocation: Decimal
+    bad_debt: Decimal
+
+
+@dataclass(frozen=True)
+class SettlementBadDebtAttribution:
+    """单笔受理记录的逐项坏账归因（不可变），与瀑布逐项同序对齐。"""
+
+    creditor: str
+    claim_amount: Decimal
+    pool_allocation: Decimal
+    capital_allocation: Decimal
+    bad_debt: Decimal
+
+
+@dataclass(frozen=True)
+class SettlementEvaluationAuditEvent:
+    """清算试算批次内单条记录的 reason_code 审计事件（不可变）。
+
+    - ``sequence``：按记录处理顺序（priority 升序、相同 priority 按
+      ``settlement_id`` 的 Unicode 码点升序）从 1 起递增的序号。
+    - ``settlement_id`` / ``debtor_id`` / ``treasury_id``：记录标识；
+      ``treasury_id`` 缺省为 ``None``。
+    - ``accepted``：受理结果；被限额拒绝为 ``False``。
+    - ``reason_code``：``"ACCEPTED"`` 表示受理，``"LIMIT_EXCEEDED"``
+      表示资金方或付款方任一层限额余量不足的整笔拒绝。
+    - ``amount``：记录金额。
+    """
+
+    sequence: int
+    settlement_id: str
+    debtor_id: str
+    treasury_id: str | None
+    accepted: bool
+    reason_code: str
+    amount: Decimal
+
+
+@dataclass(frozen=True)
+class EvaluatedSettlement:
+    """清算试算批次内单条记录的试算结果（不可变）。
+
+    结果按处理顺序（priority 升序、相同 priority 按 ``settlement_id``
+    Unicode 码点升序）排列。
+
+    - ``accepted``：是否受理；两层限额均有余量才受理，任一不足整笔拒绝。
+    - ``reason_code``：受理为 ``"ACCEPTED"``；拒绝为 ``"LIMIT_EXCEEDED"``。
+    - ``waterfalls``：受理记录的清算瀑布；拒绝记录为空元组。
+    - ``bad_debt_attributions``：逐项坏账归因；拒绝记录为空元组。
+    - ``uncovered_bad_debt``：未覆盖坏账合计；拒绝记录为 0。
+    - ``treasury_reserved_after`` / ``debtor_reserved_after``：该记录处理后
+      其资金方 / 付款方限额的累计已占额（快照 + 批内受理累计）；拒绝记录
+      等于处理前值。
+    - ``audit_event``：本记录的 reason_code 审计事件。
+    """
+
+    settlement_id: str
+    debtor_id: str
+    treasury_id: str | None
+    currency: str
+    priority: int
+    amount: Decimal
+    accepted: bool
+    reason_code: str
+    creditors: tuple[str, ...]
+    waterfalls: tuple[SettlementWaterfall, ...]
+    bad_debt_attributions: tuple[SettlementBadDebtAttribution, ...]
+    uncovered_bad_debt: Decimal
+    treasury_reserved_after: Decimal | None
+    debtor_reserved_after: Decimal
+    audit_event: SettlementEvaluationAuditEvent
+
+
+@dataclass(frozen=True)
+class SettlementBatchEvaluation:
+    """清算批次组合限额预占与确定性试算的公开返回结构（不可变）。
+
+    - ``batch_id``：批次标识。
+    - ``accepted``：批次是否被受理（整体校验通过恒为 ``True``；校验失败直接
+      抛异常，不返回本结构）。
+    - ``reservations``：每个参与限额项的 :class:`LimitReservation`，含
+      ``initial_reserved`` / ``accepted_reserved`` / ``rejected_reserved``
+      / ``final_reserved``。
+    - ``results``：排序后逐记录的 :class:`EvaluatedSettlement`。
+    - ``waterfalls``：全部受理记录瀑布的有序扁平集合。
+    - ``bad_debt_attributions``：全部受理记录逐项坏账归因的有序扁平集合。
+    - ``audit_events``：每条记录一条的 reason_code 审计事件。
+    """
+
+    batch_id: str
+    currency: str
+    accepted: bool
+    reservations: tuple[LimitReservation, ...]
+    results: tuple[EvaluatedSettlement, ...]
+    waterfalls: tuple[SettlementWaterfall, ...]
+    bad_debt_attributions: tuple[SettlementBadDebtAttribution, ...]
+    audit_events: tuple[SettlementEvaluationAuditEvent, ...]

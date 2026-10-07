@@ -197,6 +197,100 @@ batch = engine.process_multicurrency_batch(
 opening_pool_balances, requests)` 使用一次性引擎返回结果，不跨批次保留
 状态。
 
+## 清算批次组合限额预占与确定性试算
+
+`ClearingEngine.evaluate_settlement_batch(batch_id, currency,
+occupancy_snapshot, risk_policy, records)` 用清算批次的组合限额预占与
+**确定性试算**处理 `treasury_id`（资金方）与 `debtor_id`（付款方）两层
+累计占额。该入口只读、不落盘，输入只服务本次调用，不新增文件、数据库表
+或消息约定；引擎只在实例内存中跨调用保留风险策略注册表与已受理记录的
+`settlement_id` 去重集合。
+
+风险策略可用 `engine.register_risk_policy(policy_id, treasury_limit,
+debtor_limit)` 预先登记（两层非负组合限额），也可直接在 `risk_policy`
+位置传入 `RiskPolicy` 或含 `treasury_limit` / `debtor_limit` 的映射作为
+只服务本次调用的内联策略。
+
+```python
+engine.register_risk_policy("P-001", Decimal("100"), Decimal("100"))
+
+evaluation = engine.evaluate_settlement_batch(
+    "EVAL-BATCH-001",                 # 批次标识
+    "USD",                            # 批次币种（全部记录必须一致）
+    {                                 # 占额快照：限额项 -> 进入本批前已占额
+        "debtor:D1": Decimal("10"),
+        "treasury:T1": Decimal("20"),
+    },
+    "P-001",                          # 已登记策略标识；亦可传内联策略
+    [
+        {
+            "settlement_id": "S-001",
+            "debtor_id": "D1",
+            "treasury_id": "T1",      # 可选：省略则该记录不受资金方层限制
+            "amount": Decimal("30"),
+            "priority": 1,
+            "creditors": [("senior", Decimal("60")), ("equity", Decimal("40"))],
+            "supplementary_capital": Decimal("0"),  # 可选，默认 0
+            # currency 可选，缺省取批次币种；与批次币种不一致即异常
+        },
+        # ...
+    ],
+)
+```
+
+限额项标识约定为 `"debtor:<debtor_id>"` 与 `"treasury:<treasury_id>"`；
+占额快照只允许这两类非空键与非负金额，否则抛内建 `ValueError`。
+
+- **占额口径**：先加快照占额，再加批内受理金额。对每条记录，资金方与
+  付款方两层都满足 `快照已占额 + 批内已受理额 + 本笔 amount <= 该层限额`
+  （边界取等号）才受理；任一层余量不足则**整笔拒绝**，`reason_code` 为
+  `LIMIT_EXCEEDED`，不部分受理。单笔限额不足是可预期的业务拒绝，不抛
+  异常。
+- **拒绝语义**：拒绝记录不进清算瀑布、不产生坏账、不预占或修改任何一层
+  占额，也不影响后续记录的判定。
+- **处理顺序**：记录按 `priority` 升序处理，`priority` 相同按
+  `settlement_id` 的 Unicode 码点升序；相同输入结果一致。返回结果按该
+  处理顺序排列（可能与输入顺序不同）。
+- **清算瀑布与坏账**：受理记录以 `amount` 为资金来源，按债权清单先后
+  顺序受偿；再以 `supplementary_capital` 按同序补足未偿部分；两层后仍
+  未受偿的债权确认为坏账，逐项满足 `池内 + 资本 + 坏账 = 债权金额`。
+  金额沿用既有精度（`int` / `float` 按字符串形式 / `Decimal` 归一化）
+  与同币种语义，不换汇。
+- **审计**：每条记录（受理或拒绝）产生一条 `reason_code` 审计事件
+  （受理 `ACCEPTED`、拒绝 `LIMIT_EXCEEDED`），序号按处理顺序从 1 递增。
+  这些事件只在本次返回结构中给出，不写入引擎既有 `audit_log`，不占既有
+  审计序号。
+- **去重**：`settlement_id` 批内重复或与此前已受理记录重复，抛
+  `DuplicateSettlementIdError`。
+- **非法请求不部分执行**：任一校验失败都在任何占额变更 / 登记之前抛出，
+  不产生受理、坏账、瀑布或审计结果。
+
+返回不可变 `SettlementBatchEvaluation`：
+
+| 字段 | 含义 |
+| --- | --- |
+| `batch_id` / `currency` | 批次标识与去首尾空白后的批次币种 |
+| `accepted` | 批次受理结果；整体校验通过恒为 `True`（校验失败直接抛异常） |
+| `reservations` | 每个参与限额项的 `LimitReservation`：`limit_key` / `layer` / `party_id` 与 `initial_reserved`、`accepted_reserved`、`rejected_reserved`（恒为 0）、`final_reserved`、`limit`、`remaining`；覆盖占额快照全部限额项及批内出现的资金方 / 付款方 |
+| `results` | 排序后逐记录的 `EvaluatedSettlement`（受理标志、`reason_code`、瀑布、坏账归因、未覆盖坏账、处理后两层累计占额与审计事件） |
+| `waterfalls` | 全部受理记录瀑布的有序扁平集合（拒绝记录不产生） |
+| `bad_debt_attributions` | 全部受理记录逐项坏账归因的有序扁平集合 |
+| `audit_events` | 每条记录一条的 `reason_code` 审计事件 |
+
+异常类型：缺批次标识、币种或风险策略抛
+`InvalidSettlementBatchError`；`settlement_id` 批内或已登记重复抛
+`DuplicateSettlementIdError`；策略标识在注册表中不存在抛
+`RiskPolicyNotFoundError`；记录币种与批次币种不一致（含债权币种混用）抛
+`CurrencyMismatchError`；`amount` 非有限正数抛
+`InvalidSettlementAmountError`；`priority` 非整数（布尔也拒绝）抛
+`InvalidSettlementPriorityError`。异常不产生任何受理、坏账或审计结果。
+
+模块级 `vault_guard.evaluate_settlement_batch(batch_id, currency,
+occupancy_snapshot, risk_policy, records)` 使用一次性引擎（无已登记
+策略，`risk_policy` 需传 `RiskPolicy` 或内联映射），不跨调用保留占额、
+策略与去重状态。本入口不改变既有单笔、批次、风险组、预演、回收与核销
+入口的任何结果与状态。
+
 ## 批次重试与断点恢复
 
 已经进入清算处理的批次可以通过三个**可重试入口**提交，分别与三个正式
@@ -463,6 +557,12 @@ rows = engine.risk_group_bad_debt_report("USD")
 | 风险系数越界（< 0 或 > 1） | `vault_guard.InvalidRiskFactorError` |
 | 单笔请求内混合币种 | `vault_guard.MixedCurrencyError` |
 | 空批次请求清单 | `vault_guard.EmptyBatchError` |
+| 清算试算批次缺批次标识 / 币种 / 风险策略 | `vault_guard.InvalidSettlementBatchError` |
+| 清算试算 `settlement_id` 批内或已登记重复 | `vault_guard.DuplicateSettlementIdError` |
+| 清算试算引用不存在的风险策略 | `vault_guard.RiskPolicyNotFoundError` |
+| 清算试算记录币种与批次币种不一致 | `vault_guard.CurrencyMismatchError` |
+| 清算试算 `amount` 非有限正数 | `vault_guard.InvalidSettlementAmountError` |
+| 清算试算 `priority` 非整数 | `vault_guard.InvalidSettlementPriorityError` |
 | 回收币种无存续坏账（含此时零额回收 / 核销） | `vault_guard.NoOutstandingBadDebtError` |
 | 回收额超过该币种存续坏账 | `vault_guard.RecoveryAmountExceedsOutstandingError` |
 | 核销额超过该币种存续坏账 | `vault_guard.WriteoffAmountExceedsOutstandingError` |
