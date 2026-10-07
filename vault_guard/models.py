@@ -45,6 +45,11 @@ __all__ = [
     "SettlementBatchEvaluation",
     "SETTLEMENT_REASON_ACCEPTED",
     "SETTLEMENT_REASON_LIMIT_EXCEEDED",
+    "SettlementReservation",
+    "SettlementReservationView",
+    "RESERVATION_STATUS_RESERVED",
+    "RESERVATION_STATUS_CONFIRMED",
+    "RESERVATION_STATUS_CANCELLED",
 ]
 
 
@@ -711,3 +716,65 @@ class SettlementBatchEvaluation:
     audit_events: tuple[SettlementAuditEvent, ...]
     accepted_count: int
     rejected_count: int
+
+
+# --------------------------------------------------------------------------- #
+# 组合限额两阶段预占（reserve / confirm / cancel）
+# --------------------------------------------------------------------------- #
+
+# 预占已登记、等待确认或取消（活动预占，占额按层累计）。
+RESERVATION_STATUS_RESERVED = "RESERVED"
+# 预占已确认：预留额转为已确认占额，记录已追加审计并确认坏账（终态）。
+RESERVATION_STATUS_CONFIRMED = "CONFIRMED"
+# 预占已取消：活动预占与未确认结算标识已释放（终态）。
+RESERVATION_STATUS_CANCELLED = "CANCELLED"
+
+
+@dataclass(frozen=True)
+class SettlementReservation:
+    """组合限额两阶段预占的不可变结果（reserve / confirm / cancel 共用）。
+
+    - ``reservation_id`` / ``batch_id`` / ``currency``：归一化后的预占标识、
+      批次标识与币种。
+    - ``status``：``RESERVED`` / ``CONFIRMED`` / ``CANCELLED``；reserve 返回
+      ``RESERVED``，confirm / cancel 返回对应终态的同一结构。
+    - ``results``：按处理顺序（priority 升序、同优先级按 settlement_id
+      码点升序）排列的逐记录 :class:`SettlementRecordResult`，与
+      :meth:`ClearingEngine.evaluate_settlement_batch` 同口径；拒绝记录
+      不占额度。
+    - ``treasury_limits`` / ``debtor_limits``：两层各标识到
+      :class:`LimitReservation` 的只读映射（占额快照），按标识码点升序；
+      ``initial_reserved`` 为输入快照叠加已确认占额与此前活动预占后的
+      有效起算占额。
+    - ``accepted_count`` / ``rejected_count``：受理 / 拒绝记录数。
+    """
+
+    reservation_id: str
+    batch_id: str
+    currency: str
+    status: str
+    results: tuple[SettlementRecordResult, ...]
+    treasury_limits: Mapping[str, LimitReservation]
+    debtor_limits: Mapping[str, LimitReservation]
+    accepted_count: int
+    rejected_count: int
+
+
+@dataclass(frozen=True)
+class SettlementReservationView:
+    """预占的只读查询视图（不可变）：只含状态、批次、币种、reason_code 与占额。
+
+    - ``status``：``RESERVED`` / ``CONFIRMED`` / ``CANCELLED``。
+    - ``reason_codes``：结算标识到 ``ACCEPTED`` / ``LIMIT_EXCEEDED`` 的只读
+      映射，按处理顺序排列。
+    - ``treasury_reserved`` / ``debtor_reserved``：本预占当前持有的两层
+      占额（仅受理记录；已取消的预占已释放，为空映射）。
+    """
+
+    reservation_id: str
+    status: str
+    batch_id: str
+    currency: str
+    reason_codes: Mapping[str, str]
+    treasury_reserved: Mapping[str, Decimal]
+    debtor_reserved: Mapping[str, Decimal]

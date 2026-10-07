@@ -44,6 +44,13 @@
   试算入口（treasury / debtor 两层累计占额预占，按优先级确定性排序，
   返回受理结果、限额占额快照、瀑布与坏账归因及 reason_code 审计事件；
   输入只服务本次调用，仅提供引擎方法，无模块级一次性入口）；
+- :meth:`ClearingEngine.reserve_settlement_batch` /
+  :meth:`ClearingEngine.confirm_settlement_batch` /
+  :meth:`ClearingEngine.cancel_settlement_batch` /
+  :meth:`ClearingEngine.reservation_of`：组合限额两阶段预占入口
+  （先占两层额度、再确认或取消；确认把预留额转为已确认占额并逐记录
+  追加审计、确认坏账，取消释放活动预占与未确认结算标识；仅提供引擎
+  方法，状态只在实例内存中保留）；
 - :class:`~vault_guard.models.SettlementRequest` 等数据模型；
 - :mod:`vault_guard.errors` 中定义的各类异常（负数使用内建
   :class:`ValueError`）。
@@ -59,6 +66,7 @@ from .engine import (
 from .errors import (
     CurrencyMismatchError,
     DuplicateSettlementIdError,
+    DuplicateSettlementReservationError,
     DuplicateTransactionError,
     EmptyBatchError,
     EmptyCreditorListError,
@@ -68,10 +76,13 @@ from .errors import (
     InvalidSettlementAmountError,
     InvalidSettlementBatchError,
     InvalidSettlementPriorityError,
+    InvalidSettlementReservationError,
     MixedCurrencyError,
     NoOutstandingBadDebtError,
     RecoveryAmountExceedsOutstandingError,
     RiskPolicyNotFoundError,
+    SettlementReservationNotFoundError,
+    SettlementReservationStateError,
     VaultGuardError,
     WriteoffAmountExceedsOutstandingError,
 )
@@ -98,6 +109,9 @@ from .models import (
     OutstandingBadDebt,
     RecoveryAllocation,
     RecoveryResult,
+    RESERVATION_STATUS_CANCELLED,
+    RESERVATION_STATUS_CONFIRMED,
+    RESERVATION_STATUS_RESERVED,
     RiskGroupBatchResult,
     RiskGroupBatchPreviewResult,
     RiskGroupBadDebtSummary,
@@ -109,6 +123,8 @@ from .models import (
     SettlementPreview,
     SettlementRecordResult,
     SettlementRequest,
+    SettlementReservation,
+    SettlementReservationView,
     SettlementResult,
     WriteoffAllocation,
     WriteoffResult,
@@ -156,6 +172,11 @@ __all__ = [
     "SettlementBatchEvaluation",
     "SETTLEMENT_REASON_ACCEPTED",
     "SETTLEMENT_REASON_LIMIT_EXCEEDED",
+    "SettlementReservation",
+    "SettlementReservationView",
+    "RESERVATION_STATUS_RESERVED",
+    "RESERVATION_STATUS_CONFIRMED",
+    "RESERVATION_STATUS_CANCELLED",
     "VaultGuardError",
     "DuplicateTransactionError",
     "InvalidCurrencyError",
@@ -173,6 +194,10 @@ __all__ = [
     "CurrencyMismatchError",
     "InvalidSettlementAmountError",
     "InvalidSettlementPriorityError",
+    "InvalidSettlementReservationError",
+    "DuplicateSettlementReservationError",
+    "SettlementReservationNotFoundError",
+    "SettlementReservationStateError",
 ]
 
 __version__ = "0.1.0"

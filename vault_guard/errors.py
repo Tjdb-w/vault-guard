@@ -19,6 +19,10 @@
 - 记录币种与批次币种不一致 -> :class:`CurrencyMismatchError`
 - 结算金额非有限正数 -> :class:`InvalidSettlementAmountError`
 - 结算优先级非整数 -> :class:`InvalidSettlementPriorityError`
+- 预占标识缺失或为空 -> :class:`InvalidSettlementReservationError`
+- 预占标识重复 -> :class:`DuplicateSettlementReservationError`
+- 预占标识未知 -> :class:`SettlementReservationNotFoundError`
+- 预占终态误操作 -> :class:`SettlementReservationStateError`
 """
 
 __all__ = [
@@ -39,6 +43,10 @@ __all__ = [
     "CurrencyMismatchError",
     "InvalidSettlementAmountError",
     "InvalidSettlementPriorityError",
+    "InvalidSettlementReservationError",
+    "DuplicateSettlementReservationError",
+    "SettlementReservationNotFoundError",
+    "SettlementReservationStateError",
 ]
 
 
@@ -108,3 +116,19 @@ class InvalidSettlementAmountError(VaultGuardError):
 
 class InvalidSettlementPriorityError(VaultGuardError):
     """结算优先级不是整数。"""
+
+
+class InvalidSettlementReservationError(VaultGuardError):
+    """预占标识（reservation_id）缺失或为空。"""
+
+
+class DuplicateSettlementReservationError(VaultGuardError):
+    """预占标识与已登记的预占标识重复（含已确认 / 已取消的终态预占）。"""
+
+
+class SettlementReservationNotFoundError(VaultGuardError):
+    """确认、取消或查询引用了未知的预占标识。"""
+
+
+class SettlementReservationStateError(VaultGuardError):
+    """对终态预占的误操作：确认后不能取消，取消后不能确认，终态不能重复确认 / 取消。"""

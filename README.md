@@ -331,6 +331,52 @@ evaluation = engine.evaluate_settlement_batch(
   `InvalidSettlementAmountError`；`priority` 非整数 →
   `InvalidSettlementPriorityError`。
 
+## 组合限额两阶段预占
+
+`ClearingEngine.reserve_settlement_batch(reservation_id, batch_id, currency,
+reservation_snapshot, risk_policy, records)` 在试算口径之上把组合限额拆成
+**先占额度、再确认或取消** 两阶段（仅提供引擎方法，状态只在实例内存中保留）：
+
+```python
+reservation = engine.reserve_settlement_batch(
+    reservation_id="RSV-001",        # 预占标识，全局唯一（含终态）
+    batch_id="BATCH-900",            # 以下参数语义同 evaluate_settlement_batch
+    currency="USD",
+    reservation_snapshot={"treasury": {"T1": Decimal("50")}, "debtor": {}},
+    risk_policy={
+        "treasury_limits": {"T1": Decimal("1000")},
+        "debtor_limits": {"D1": Decimal("500")},
+    },
+    records=[/* 同 evaluate_settlement_batch 的记录结构 */],
+)
+confirmed = engine.confirm_settlement_batch("RSV-001")   # 确认（终态）
+# engine.cancel_settlement_batch("RSV-001")              # 或取消（终态）
+view = engine.reservation_of("RSV-001")                  # 只读查询
+```
+
+- **reserve（先占）**：排序、两层余量判定（边界取等号受理）、
+  `LIMIT_EXCEEDED` 整笔拒绝、清算瀑布、补充资本与坏账归因完全沿用
+  `evaluate_settlement_batch` 口径；拒绝记录不占额度。活动预占按层累计：
+  起算占额为输入快照叠加已确认占额与此前全部活动预占，后续 reserve 自动
+  计入快照和未结预占。返回不可变 `SettlementReservation`（`status` 为
+  `RESERVED`，含逐记录结果与两层占额快照）。本阶段不写资金池、坏账台账
+  或审计台账；本批 `settlement_id` 登记为未确认标识，不得复用。
+- **confirm（确认）**：预留额转为已确认占额并继续阻止后续超额；每条记录
+  （受理或拒绝）按处理顺序追加一条既有结构审计事件（序号继续递增），复用
+  预占返回的分配与坏账归因——受理记录的未覆盖坏账进入存续坏账台账，可由
+  `process_recovery` / `process_writeoff` 及定向入口处理，结算标识登记为
+  业务流水号（保留 recovery、writeoff、risk group 与 transaction_id 语义）。
+- **cancel（取消）**：释放活动预占与未确认结算标识（可复用），不生成审计、
+  不确认坏账、不改资金池。
+- **终态**：确认后不能取消，取消后不能确认，终态不能重复确认 / 取消。
+- **查询**：`reservation_of` 只返回状态、批次、币种、逐记录 `reason_code`
+  与本预占当前持有的两层占额（已取消的预占占额为空），不改任何状态。
+- **异常**：`reservation_id` 缺失或为空 → `InvalidSettlementReservationError`；
+  预占标识重复 → `DuplicateSettlementReservationError`；未知标识 →
+  `SettlementReservationNotFoundError`；终态误操作 →
+  `SettlementReservationStateError`；其余输入异常沿用
+  `evaluate_settlement_batch`。校验失败不产生占额、审计、坏账或标识登记。
+
 ## 处理规则（确定顺序）
 
 1. **输入校验**：负数金额/余额、重复流水号、缺币种、空债权清单、系数越界
@@ -542,6 +588,10 @@ rows = engine.risk_group_bad_debt_report("USD")
 | 记录币种与批次币种不一致 | `vault_guard.CurrencyMismatchError` |
 | 结算金额非有限正数 | `vault_guard.InvalidSettlementAmountError` |
 | 结算优先级非整数 | `vault_guard.InvalidSettlementPriorityError` |
+| 预占标识缺失或为空 | `vault_guard.InvalidSettlementReservationError` |
+| 预占标识重复 | `vault_guard.DuplicateSettlementReservationError` |
+| 预占标识未知 | `vault_guard.SettlementReservationNotFoundError` |
+| 预占终态误操作 | `vault_guard.SettlementReservationStateError` |
 
 校验异常不产生任何半成品分配，也不写入审计台账；失败请求的流水号不被占用，
 可在修正后用同一流水号重新提交。
