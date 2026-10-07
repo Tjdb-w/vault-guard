@@ -126,6 +126,28 @@ outstanding_bad_debt``（与 :meth:`outstanding_bad_debts` 该债权人余额
 或流水号登记，仅把本批 ``settlement_id`` 登记到引擎内存用于跨批次去重；
 不新增文件、数据库表或消息约定。
 
+组合限额两阶段占用（:meth:`ClearingEngine.reserve_settlement_batch` /
+:meth:`ClearingEngine.confirm_settlement_batch` /
+:meth:`ClearingEngine.cancel_settlement_batch`）在试算口径之上把预占
+落到引擎内存：reserve 先占 ``treasury_id`` 与 ``debtor_id`` 两层额度，
+起始占额为外部快照叠加引擎内全部活动预占与已确认占额（后续 reserve 计入
+快照与未结预占，已确认占额继续阻止超额），受理记录按层累计为活动预占，
+拒绝记录不占额度；reserve 不写审计台账、不确认坏账、不动资金池，返回与
+试算同构的不可变预占结果与占额快照。confirm 把受理占额由活动预占转为
+已确认占额（并重验两层余量），每条受理或拒绝记录复用 reserve 的分配与
+坏账结果追加一条既有结构审计事件，受理坏账进入存续台账，保留 recovery /
+writeoff / risk group 与 transaction_id 语义。cancel 释放活动预占与未
+确认 ``settlement_id``，不生成审计、不确认坏账、不改资金池。确认后不能
+取消、取消后不能确认，终态误操作抛
+:class:`SettlementReservationStateError`；
+:meth:`ClearingEngine.get_settlement_reservation` 为只读查询，只返回
+状态、批次、币种、reason_code 与两层占额快照。四类预占标识错误分别抛
+:class:`InvalidSettlementReservationError` /
+:class:`DuplicateSettlementReservationError` /
+:class:`SettlementReservationNotFoundError` /
+:class:`SettlementReservationStateError`，其余输入异常沿用试算口径，
+校验失败不产生占额、审计、坏账或标识登记。
+
 校验异常不产生任何分配，也不写入台账；重复流水号在任何状态变更之前抛出。
 """
 
@@ -142,6 +164,7 @@ from typing import Union
 from .errors import (
     CurrencyMismatchError,
     DuplicateSettlementIdError,
+    DuplicateSettlementReservationError,
     DuplicateTransactionError,
     EmptyBatchError,
     EmptyCreditorListError,
@@ -151,10 +174,13 @@ from .errors import (
     InvalidSettlementAmountError,
     InvalidSettlementBatchError,
     InvalidSettlementPriorityError,
+    InvalidSettlementReservationError,
     MixedCurrencyError,
     NoOutstandingBadDebtError,
     RecoveryAmountExceedsOutstandingError,
     RiskPolicyNotFoundError,
+    SettlementReservationNotFoundError,
+    SettlementReservationStateError,
     WriteoffAmountExceedsOutstandingError,
 )
 from .models import (
@@ -188,10 +214,15 @@ from .models import (
     SettlementBatchEvaluation,
     SettlementPreview,
     SettlementRecordResult,
+    SettlementReservation,
+    SettlementReservationView,
     SettlementRequest,
     SettlementResult,
     WriteoffAllocation,
     WriteoffResult,
+    RESERVATION_STATE_CANCELLED,
+    RESERVATION_STATE_CONFIRMED,
+    RESERVATION_STATE_RESERVED,
 )
 
 __all__ = [
@@ -347,6 +378,60 @@ class _SettlementRecord:
     supplementary_capital: Decimal
 
 
+@dataclass
+class _SettlementReservationRun:
+    """一个预占标识的两阶段占用记录（引擎私有，可变）。
+
+    - ``state``：``RESERVED`` / ``CONFIRMED`` / ``CANCELLED``。
+    - ``batch_id`` / ``currency``：预占归属的批次与币种。
+    - ``ordered``：按处理顺序排列的归一化记录。
+    - ``results`` / ``events``：reserve 复用 evaluate 口径算出的逐记录
+      受理结果与 reason_code 事件（confirm 直接复用，不再重算瀑布与坏账）。
+    - ``treasury_usage`` / ``debtor_usage``：批内各标识的受理占额合计
+      （拒绝记录为 0），用于 confirm 转已确认占额与 cancel 释放活动预占。
+    - ``treasury_limits`` / ``debtor_limits``：reserve 返回的不可变占额
+      快照，查询原样回传。
+    - ``treasury_policy`` / ``debtor_policy``：本批引用的两层限额表，
+      confirm 重验余量时使用。
+    - ``snapshot_treasury`` / ``snapshot_debtor``：reserve 输入的外部占额
+      快照，confirm 重验余量时作为起始占用的一部分。
+    """
+
+    state: str
+    batch_id: str
+    currency: str
+    ordered: list[_SettlementRecord]
+    results: tuple[SettlementRecordResult, ...]
+    events: tuple[SettlementAuditEvent, ...]
+    treasury_usage: dict[str, Decimal]
+    debtor_usage: dict[str, Decimal]
+    treasury_limits: Mapping[str, LimitReservation]
+    debtor_limits: Mapping[str, LimitReservation]
+    treasury_policy: dict[str, Decimal]
+    debtor_policy: dict[str, Decimal]
+    snapshot_treasury: dict[str, Decimal]
+    snapshot_debtor: dict[str, Decimal]
+
+
+@dataclass(frozen=True)
+class _SettlementBatchComputation:
+    """两层预占试算的纯计算结果（引擎私有，不可变）。
+
+    - ``results`` / ``events``：逐记录受理结果与 reason_code 事件。
+    - ``treasury_accepted`` / ``debtor_accepted``：批内各标识受理占额合计，
+      覆盖返回标识集合（未受理标识为 0），reserve 据此累计活动预占。
+    - ``treasury_view`` / ``debtor_view``：对外不可变的 :class:`LimitReservation`
+      快照映射。
+    """
+
+    results: tuple[SettlementRecordResult, ...]
+    events: tuple[SettlementAuditEvent, ...]
+    treasury_accepted: dict[str, Decimal]
+    debtor_accepted: dict[str, Decimal]
+    treasury_view: Mapping[str, LimitReservation]
+    debtor_view: Mapping[str, LimitReservation]
+
+
 def _stable_json(value: object) -> str:
     """把批次输入递归归一化为确定性 JSON 文本。
 
@@ -498,6 +583,15 @@ class ClearingEngine:
         # 清算批次试算已登记的结算标识（跨调用去重；仅此一项跨调用保留，
         # 占额快照、风险策略与记录等输入只服务当次调用）。
         self._seen_settlement_ids: set[str] = set()
+        # 组合限额两阶段占用：预占标识 -> 内部预占记录；两层各维护活动预占
+        # （_reserved_*）与已确认占额（_confirmed_*），均跨预占累计。
+        # _reservation_lock 串行三个人写入口与查询，保证占额桶一致。
+        self._reservations: dict[str, _SettlementReservationRun] = {}
+        self._reserved_treasury: dict[str, Decimal] = {}
+        self._reserved_debtor: dict[str, Decimal] = {}
+        self._confirmed_treasury: dict[str, Decimal] = {}
+        self._confirmed_debtor: dict[str, Decimal] = {}
+        self._reservation_lock = Lock()
 
     # ------------------------------------------------------------------ #
     # 只读查询（不触发清算，不改变任何状态）
@@ -1531,6 +1625,73 @@ class ClearingEngine:
         - ``amount`` 非有限正数：:class:`InvalidSettlementAmountError`；
         - ``priority`` 非整数：:class:`InvalidSettlementPriorityError`。
         """
+        (
+            batch_id,
+            currency,
+            ordered,
+            treasury_policy,
+            debtor_policy,
+            snapshot_treasury,
+            snapshot_debtor,
+        ) = self._prepare_settlement_batch(
+            batch_id, currency, reservation_snapshot, risk_policy, records
+        )
+
+        computation = self._compute_settlement_batch(
+            batch_id=batch_id,
+            ordered=ordered,
+            treasury_policy=treasury_policy,
+            debtor_policy=debtor_policy,
+            initial_treasury=snapshot_treasury,
+            initial_debtor=snapshot_debtor,
+            snapshot_treasury=snapshot_treasury,
+            snapshot_debtor=snapshot_debtor,
+        )
+
+        # 试算全部完成后才登记结算标识：异常路径不产生任何登记。
+        self._seen_settlement_ids.update(
+            record.settlement_id for record in ordered
+        )
+
+        return SettlementBatchEvaluation(
+            batch_id=batch_id,
+            currency=currency,
+            results=computation.results,
+            treasury_limits=computation.treasury_view,
+            debtor_limits=computation.debtor_view,
+            audit_events=computation.events,
+            accepted_count=sum(
+                1 for result in computation.results if result.accepted
+            ),
+            rejected_count=sum(
+                1 for result in computation.results if not result.accepted
+            ),
+        )
+
+    def _prepare_settlement_batch(
+        self,
+        batch_id: str,
+        currency: str,
+        reservation_snapshot: Mapping[str, Mapping[str, Number]] | None,
+        risk_policy: Mapping[str, Mapping[str, Number]],
+        records: Iterable[Mapping[str, object]],
+    ) -> tuple[
+        str,
+        str,
+        list[_SettlementRecord],
+        dict[str, Decimal],
+        dict[str, Decimal],
+        dict[str, Decimal],
+        dict[str, Decimal],
+    ]:
+        """evaluate 与 reserve 共用的整体校验与归一化（不修改任何状态）。
+
+        校验顺序与异常口径完全沿用 :meth:`evaluate_settlement_batch`：
+        批次标识 / 币种 / 风险策略 / 占额快照 / 记录可迭代 / 结算标识结构
+        与批内或跨批次重复 / 两层策略存在性 / 逐记录币种、金额、优先级、
+        补充资本与债权清单。返回按处理顺序（priority 升序、同优先级按
+        settlement_id 码点升序）排列的记录、两层限额表与两层外部快照。
+        """
         if not isinstance(batch_id, str) or not batch_id.strip():
             raise InvalidSettlementBatchError("批次标识缺失或为空")
         batch_id = batch_id.strip()
@@ -1625,13 +1786,43 @@ class ClearingEngine:
         ordered = sorted(
             normalized, key=lambda record: (record.priority, record.settlement_id)
         )
+        return (
+            batch_id,
+            currency,
+            ordered,
+            treasury_limits,
+            debtor_limits,
+            snapshot_treasury,
+            snapshot_debtor,
+        )
 
-        treasury_ids = set(treasury_limits) | set(snapshot_treasury)
-        debtor_ids = set(debtor_limits) | set(snapshot_debtor)
+    def _compute_settlement_batch(
+        self,
+        *,
+        batch_id: str,
+        ordered: Sequence[_SettlementRecord],
+        treasury_policy: Mapping[str, Decimal],
+        debtor_policy: Mapping[str, Decimal],
+        initial_treasury: Mapping[str, Decimal],
+        initial_debtor: Mapping[str, Decimal],
+        snapshot_treasury: Mapping[str, Decimal],
+        snapshot_debtor: Mapping[str, Decimal],
+    ) -> "_SettlementBatchComputation":
+        """按 evaluate 口径执行两层预占、瀑布、坏账与 reason_code 事件。
+
+        纯计算、不修改引擎状态：``initial_*`` 给出每个返回标识的起始占额
+        （evaluate 只含外部快照；reserve 另含引擎内活动预占与已确认占额），
+        返回标识集合为策略与外部快照标识的并集。拒绝记录不占额度、不进
+        瀑布、不产生坏账，金额只计入引用限额的 ``rejected_reserved``。
+        """
+        treasury_ids = set(treasury_policy) | set(snapshot_treasury)
+        debtor_ids = set(debtor_policy) | set(snapshot_debtor)
         treasury_used = {
-            key: snapshot_treasury.get(key, _ZERO) for key in treasury_ids
+            key: initial_treasury.get(key, _ZERO) for key in treasury_ids
         }
-        debtor_used = {key: snapshot_debtor.get(key, _ZERO) for key in debtor_ids}
+        debtor_used = {
+            key: initial_debtor.get(key, _ZERO) for key in debtor_ids
+        }
         treasury_accepted = {key: _ZERO for key in treasury_ids}
         treasury_rejected = {key: _ZERO for key in treasury_ids}
         debtor_accepted = {key: _ZERO for key in debtor_ids}
@@ -1642,11 +1833,11 @@ class ClearingEngine:
         for record in ordered:
             treasury_ok = record.treasury_id is None or (
                 treasury_used[record.treasury_id] + record.amount
-                <= treasury_limits[record.treasury_id]
+                <= treasury_policy[record.treasury_id]
             )
             debtor_ok = (
                 debtor_used[record.debtor_id] + record.amount
-                <= debtor_limits[record.debtor_id]
+                <= debtor_policy[record.debtor_id]
             )
             accepted = treasury_ok and debtor_ok
             if accepted:
@@ -1683,42 +1874,549 @@ class ClearingEngine:
                 )
             )
 
-        # 试算全部完成后才登记结算标识：异常路径不产生任何登记。
-        self._seen_settlement_ids.update(
-            record.settlement_id for record in normalized
+        treasury_view = MappingProxyType(
+            {
+                key: LimitReservation(
+                    limit=treasury_policy.get(key),
+                    initial_reserved=initial_treasury.get(key, _ZERO),
+                    accepted_reserved=treasury_accepted[key],
+                    rejected_reserved=treasury_rejected[key],
+                    final_reserved=treasury_used[key],
+                )
+                for key in sorted(treasury_ids)
+            }
+        )
+        debtor_view = MappingProxyType(
+            {
+                key: LimitReservation(
+                    limit=debtor_policy.get(key),
+                    initial_reserved=initial_debtor.get(key, _ZERO),
+                    accepted_reserved=debtor_accepted[key],
+                    rejected_reserved=debtor_rejected[key],
+                    final_reserved=debtor_used[key],
+                )
+                for key in sorted(debtor_ids)
+            }
+        )
+        return _SettlementBatchComputation(
+            results=tuple(results),
+            events=tuple(events),
+            treasury_accepted=treasury_accepted,
+            debtor_accepted=debtor_accepted,
+            treasury_view=treasury_view,
+            debtor_view=debtor_view,
         )
 
-        return SettlementBatchEvaluation(
-            batch_id=batch_id,
-            currency=currency,
-            results=tuple(results),
-            treasury_limits=MappingProxyType(
-                {
-                    key: LimitReservation(
-                        limit=treasury_limits.get(key),
-                        initial_reserved=snapshot_treasury.get(key, _ZERO),
-                        accepted_reserved=treasury_accepted[key],
-                        rejected_reserved=treasury_rejected[key],
-                        final_reserved=treasury_used[key],
+    # ------------------------------------------------------------------ #
+    # 组合限额两阶段占用：reserve / confirm / cancel 与只读查询
+    #
+    # reserve 沿用 evaluate_settlement_batch 的全部输入校验与试算口径，先
+    # 占 treasury_id 与 debtor_id 两层额度：起始占额为外部快照叠加引擎内
+    # 全部活动预占与已确认占额，受理记录按层累计为活动预占，拒绝记录不占
+    # 额度。活动预占阻止后续 reserve / confirm 超额；confirm 把受理占额由
+    # 活动预占转为已确认占额（再次守住两层余量），并把每条受理或拒绝记录
+    # 追加到既有内存审计台账、确认坏账，复用 reserve 返回的分配与坏账结果；
+    # cancel 释放活动预占与未确认 settlement_id，不生成审计、不确认坏账、
+    # 不改资金池。确认后不能取消、取消后不能确认，终态再操作抛状态异常。
+    # 三个人写入口与查询仅维护引擎实例内存状态。
+    # ------------------------------------------------------------------ #
+
+    def reserve_settlement_batch(
+        self,
+        reservation_id: str,
+        batch_id: str,
+        currency: str,
+        reservation_snapshot: Mapping[str, Mapping[str, Number]] | None,
+        risk_policy: Mapping[str, Mapping[str, Number]],
+        records: Iterable[Mapping[str, object]],
+    ) -> SettlementReservation:
+        """建立组合限额两阶段占用的活动预占，返回不可变
+        :class:`SettlementReservation`。
+
+        参数与 :meth:`evaluate_settlement_batch` 相同，另在首位接收
+        ``reservation_id``（预占标识，非空字符串，去首尾空白）。处理顺序、
+        两层余量判定（边界取等号受理）、``LIMIT_EXCEEDED`` 整笔拒绝、
+        清算瀑布、补充资本与坏账归因口径全部沿用试算：
+
+        - 起始占额 = 外部 ``reservation_snapshot`` + 引擎内全部**活动预占**
+          + **已确认占额**；即后续预占计入快照与未结预占，已确认占额继续
+          阻止超额。
+        - 受理记录按层累计为活动预占，拒绝记录不占额度（仅计入返回快照的
+          ``rejected_reserved``）。
+        - 预占不写内存审计台账、不确认坏账、不动资金池；返回结构与试算同构，
+          另含 ``reservation_id`` / ``state``（``RESERVED``）与空
+          ``event_ids``。
+        - 预占把本批全部 ``settlement_id`` 登记到引擎内存：后续 evaluate /
+          reserve 不能复用，cancel 后释放，confirm 后永久保留。
+
+        异常（不产生占额、审计、坏账或标识登记）：
+
+        - ``reservation_id`` 缺失或去首尾空白后为空：
+          :class:`InvalidSettlementReservationError`；
+        - ``reservation_id`` 与引擎中既有预占（含已确认 / 已取消终态）
+          重复：:class:`DuplicateSettlementReservationError`；
+        - 其余输入异常（批次标识 / 币种 / 风险策略、结算标识重复、策略
+          未登记、币种不一致、金额、优先级等）完全沿用
+          :meth:`evaluate_settlement_batch` 的异常类型与顺序。
+        """
+        reservation_key = self._require_reservation_id(reservation_id)
+
+        # 预占子系统串行：登记判定、试算与活动占额更新在同一把锁内完成。
+        with self._reservation_lock:
+            if reservation_key in self._reservations:
+                raise DuplicateSettlementReservationError(
+                    f"重复的预占标识: {reservation_key}"
+                )
+
+            (
+                batch_id,
+                currency,
+                ordered,
+                treasury_policy,
+                debtor_policy,
+                snapshot_treasury,
+                snapshot_debtor,
+            ) = self._prepare_settlement_batch(
+                batch_id,
+                currency,
+                reservation_snapshot,
+                risk_policy,
+                records,
+            )
+
+            initial_treasury = {
+                key: snapshot_treasury.get(key, _ZERO)
+                + self._reserved_treasury.get(key, _ZERO)
+                + self._confirmed_treasury.get(key, _ZERO)
+                for key in set(treasury_policy) | set(snapshot_treasury)
+            }
+            initial_debtor = {
+                key: snapshot_debtor.get(key, _ZERO)
+                + self._reserved_debtor.get(key, _ZERO)
+                + self._confirmed_debtor.get(key, _ZERO)
+                for key in set(debtor_policy) | set(snapshot_debtor)
+            }
+
+            computation = self._compute_settlement_batch(
+                batch_id=batch_id,
+                ordered=ordered,
+                treasury_policy=treasury_policy,
+                debtor_policy=debtor_policy,
+                initial_treasury=initial_treasury,
+                initial_debtor=initial_debtor,
+                snapshot_treasury=snapshot_treasury,
+                snapshot_debtor=snapshot_debtor,
+            )
+
+            # 校验与试算全部成功后才登记标识并累计活动预占。
+            run = _SettlementReservationRun(
+                state=RESERVATION_STATE_RESERVED,
+                batch_id=batch_id,
+                currency=currency,
+                ordered=ordered,
+                results=computation.results,
+                events=computation.events,
+                treasury_usage=dict(computation.treasury_accepted),
+                debtor_usage=dict(computation.debtor_accepted),
+                treasury_limits=computation.treasury_view,
+                debtor_limits=computation.debtor_view,
+                treasury_policy=dict(treasury_policy),
+                debtor_policy=dict(debtor_policy),
+                snapshot_treasury=dict(snapshot_treasury),
+                snapshot_debtor=dict(snapshot_debtor),
+            )
+            for key, amount in computation.treasury_accepted.items():
+                if amount:
+                    self._reserved_treasury[key] = (
+                        self._reserved_treasury.get(key, _ZERO) + amount
                     )
-                    for key in sorted(treasury_ids)
-                }
-            ),
-            debtor_limits=MappingProxyType(
-                {
-                    key: LimitReservation(
-                        limit=debtor_limits.get(key),
-                        initial_reserved=snapshot_debtor.get(key, _ZERO),
-                        accepted_reserved=debtor_accepted[key],
-                        rejected_reserved=debtor_rejected[key],
-                        final_reserved=debtor_used[key],
+            for key, amount in computation.debtor_accepted.items():
+                if amount:
+                    self._reserved_debtor[key] = (
+                        self._reserved_debtor.get(key, _ZERO) + amount
                     )
-                    for key in sorted(debtor_ids)
-                }
+            self._seen_settlement_ids.update(
+                record.settlement_id for record in ordered
+            )
+            self._reservations[reservation_key] = run
+
+            return self._build_reservation(run, reservation_key)
+
+    def confirm_settlement_batch(
+        self, reservation_id: str
+    ) -> SettlementReservation:
+        """确认活动预占，返回不可变 :class:`SettlementReservation`
+        （``state=CONFIRMED``，``event_ids`` 为本次写入的审计事件标识）。
+
+        确认把受理记录的两层占额由活动预占**转为已确认占额**，并再次守住
+        两层余量（起始口径同 reserve：外部快照 + 其他活动预占 + 已确认 +
+        本批已转确认累计；边界取等号），余量被挤占时抛
+        :class:`InvalidSettlementBatchError` 且不产生任何转移、审计或坏账。
+
+        每条受理或拒绝记录各追加一条既有结构内存审计事件（序号递增）：
+        受理事件 ``validation_result=APPROVED``、事件标识
+        ``EVT-{settlement_id}-approved``，未覆盖债权进入存续坏账台账，可由
+        :meth:`process_recovery` / :meth:`process_writeoff` 冲减 / 核销；
+        拒绝事件为 ``REJECTED`` + ``LIMIT_EXCEEDED``，不确认坏账。瀑布
+        分配、资本承担、坏账归因、recovery / writeoff / risk group 与
+        transaction_id 语义全部复用 reserve 的受理结果，不重新试算。
+        确认后 ``settlement_id`` 永久登记为业务流水号，且预占不可再取消。
+
+        - ``reservation_id`` 缺失或为空：
+          :class:`InvalidSettlementReservationError`；
+        - 未知标识：:class:`SettlementReservationNotFoundError`；
+        - 已确认或已取消（终态）再确认：
+          :class:`SettlementReservationStateError`。
+        """
+        reservation_key = self._require_reservation_id(reservation_id)
+        with self._reservation_lock:
+            run = self._require_active_reservation(reservation_key, "确认")
+
+            events_mark = len(self._events)
+            sequence_mark = self._sequence
+            ledger_mark = len(self._bad_debt_ledger)
+            # 记录本批已由活动桶转出的占额，便于异常时还原两个占额桶。
+            transferred_treasury: dict[str, Decimal] = {}
+            transferred_debtor: dict[str, Decimal] = {}
+            added_transactions: list[str] = []
+            event_ids: list[str] = []
+            try:
+                for record, result in zip(
+                    run.ordered, run.results, strict=True
+                ):
+                    if result.accepted:
+                        # 再次守住两层余量：外部快照 + 全部已确认 + 其他活动
+                        # 预占（活动桶扣除本批尚未转出的部分）+ 本笔。
+                        self._check_confirmation_room(
+                            run,
+                            transferred_treasury,
+                            transferred_debtor,
+                            record,
+                        )
+                        if record.treasury_id is not None:
+                            self._reserved_treasury[record.treasury_id] = (
+                                self._reserved_treasury.get(
+                                    record.treasury_id, _ZERO
+                                )
+                                - record.amount
+                            )
+                            self._confirmed_treasury[record.treasury_id] = (
+                                self._confirmed_treasury.get(
+                                    record.treasury_id, _ZERO
+                                )
+                                + record.amount
+                            )
+                            transferred_treasury[record.treasury_id] = (
+                                transferred_treasury.get(
+                                    record.treasury_id, _ZERO
+                                )
+                                + record.amount
+                            )
+                        self._reserved_debtor[record.debtor_id] = (
+                            self._reserved_debtor.get(
+                                record.debtor_id, _ZERO
+                            )
+                            - record.amount
+                        )
+                        self._confirmed_debtor[record.debtor_id] = (
+                            self._confirmed_debtor.get(
+                                record.debtor_id, _ZERO
+                            )
+                            + record.amount
+                        )
+                        transferred_debtor[record.debtor_id] = (
+                            transferred_debtor.get(record.debtor_id, _ZERO)
+                            + record.amount
+                        )
+                    event_id = self._append_reservation_record_audit(run, result)
+                    event_ids.append(event_id)
+                    added_transactions.append(record.settlement_id)
+            except Exception:
+                # 原子失败：还原审计、坏账、流水号登记与两个占额桶，预占
+                # 保持活动状态，调用方可修正后再次确认。
+                del self._events[events_mark:]
+                self._sequence = sequence_mark
+                del self._bad_debt_ledger[ledger_mark:]
+                for sid in added_transactions:
+                    self._seen_transactions.discard(sid)
+                    self._results.pop(sid, None)
+                for key, amount in transferred_treasury.items():
+                    self._reserved_treasury[key] = (
+                        self._reserved_treasury.get(key, _ZERO) + amount
+                    )
+                    self._confirmed_treasury[key] = (
+                        self._confirmed_treasury.get(key, _ZERO) - amount
+                    )
+                for key, amount in transferred_debtor.items():
+                    self._reserved_debtor[key] = (
+                        self._reserved_debtor.get(key, _ZERO) + amount
+                    )
+                    self._confirmed_debtor[key] = (
+                        self._confirmed_debtor.get(key, _ZERO) - amount
+                    )
+                raise
+
+            run.state = RESERVATION_STATE_CONFIRMED
+            return self._build_reservation(
+                run, reservation_key, event_ids=tuple(event_ids)
+            )
+
+    def cancel_settlement_batch(
+        self, reservation_id: str
+    ) -> SettlementReservation:
+        """取消活动预占，返回不可变 :class:`SettlementReservation`
+        （``state=CANCELLED``）。
+
+        取消释放该预占的全部**活动预占**（按层冲减受理占额）与本批尚未
+        确认的全部 ``settlement_id`` 登记（受理与拒绝记录都释放），使这些
+        标识可被后续 evaluate / reserve 重新使用。取消不生成审计事件、不
+        确认坏账、不改资金池或其他预占；预占保留为终态登记，重复使用同一
+        ``reservation_id`` 仍抛 :class:`DuplicateSettlementReservationError`。
+
+        - ``reservation_id`` 缺失或为空：
+          :class:`InvalidSettlementReservationError`；
+        - 未知标识：:class:`SettlementReservationNotFoundError`；
+        - 已确认或已取消（终态）再取消：
+          :class:`SettlementReservationStateError`。
+        """
+        reservation_key = self._require_reservation_id(reservation_id)
+        with self._reservation_lock:
+            run = self._require_active_reservation(reservation_key, "取消")
+
+            for key, amount in run.treasury_usage.items():
+                if amount:
+                    self._reserved_treasury[key] = (
+                        self._reserved_treasury.get(key, _ZERO) - amount
+                    )
+            for key, amount in run.debtor_usage.items():
+                if amount:
+                    self._reserved_debtor[key] = (
+                        self._reserved_debtor.get(key, _ZERO) - amount
+                    )
+            for record in run.ordered:
+                self._seen_settlement_ids.discard(record.settlement_id)
+
+            run.state = RESERVATION_STATE_CANCELLED
+            return self._build_reservation(run, reservation_key)
+
+    def get_settlement_reservation(
+        self, reservation_id: str
+    ) -> SettlementReservationView:
+        """只读查询预占状态，返回不可变 :class:`SettlementReservationView`。
+
+        只暴露预占标识、当前状态（``RESERVED`` / ``CONFIRMED`` /
+        ``CANCELLED``）、批次、币种、按处理顺序排列的每条记录
+        ``reason_code`` 与建立预占时的两层不可变占额快照；不重算占额、
+        不生成事件、不改任何状态。
+
+        - ``reservation_id`` 缺失或为空：
+          :class:`InvalidSettlementReservationError`；
+        - 未知标识：:class:`SettlementReservationNotFoundError`。
+        """
+        reservation_key = self._require_reservation_id(reservation_id)
+        with self._reservation_lock:
+            run = self._reservations.get(reservation_key)
+            if run is None:
+                raise SettlementReservationNotFoundError(
+                    f"未知的预占标识: {reservation_key}"
+                )
+            return SettlementReservationView(
+                reservation_id=reservation_key,
+                state=run.state,
+                batch_id=run.batch_id,
+                currency=run.currency,
+                reason_codes=tuple(
+                    result.reason_code for result in run.results
+                ),
+                treasury_limits=run.treasury_limits,
+                debtor_limits=run.debtor_limits,
+            )
+
+    @staticmethod
+    def _require_reservation_id(reservation_id: object) -> str:
+        """校验预占标识：非字符串或去首尾空白后为空抛
+        :class:`InvalidSettlementReservationError`。"""
+        if (
+            not isinstance(reservation_id, str)
+            or not reservation_id.strip()
+        ):
+            raise InvalidSettlementReservationError(
+                "预占标识 reservation_id 缺失或为空"
+            )
+        return reservation_id.strip()
+
+    def _require_active_reservation(
+        self, reservation_key: str, action: str
+    ) -> _SettlementReservationRun:
+        """读取预占并要求其处于活动状态；未知抛 NotFound、终态抛 StateError。"""
+        run = self._reservations.get(reservation_key)
+        if run is None:
+            raise SettlementReservationNotFoundError(
+                f"未知的预占标识: {reservation_key}"
+            )
+        if run.state != RESERVATION_STATE_RESERVED:
+            raise SettlementReservationStateError(
+                f"预占 {reservation_key} 已处于终态 {run.state}，"
+                f"不能再次{action}"
+            )
+        return run
+
+    def _check_confirmation_room(
+        self,
+        run: _SettlementReservationRun,
+        transferred_treasury: Mapping[str, Decimal],
+        transferred_debtor: Mapping[str, Decimal],
+        record: _SettlementRecord,
+    ) -> None:
+        """确认单笔受理记录前重验两层余量，不足抛
+        :class:`InvalidSettlementBatchError`。
+
+        其他活动预占 = 活动桶现状 - 本批尚未转出的受理占额；起始占用为
+        外部快照 + 全部已确认占额 + 其他活动预占 + 本批已转出累计。
+        """
+        if record.treasury_id is not None:
+            key = record.treasury_id
+            pending_self = (
+                run.treasury_usage.get(key, _ZERO)
+                - transferred_treasury.get(key, _ZERO)
+            )
+            occupied = (
+                run.snapshot_treasury.get(key, _ZERO)
+                + self._confirmed_treasury.get(key, _ZERO)
+                + self._reserved_treasury.get(key, _ZERO)
+                - pending_self
+            )
+            if occupied + record.amount > run.treasury_policy[key]:
+                raise InvalidSettlementBatchError(
+                    f"确认预占时 treasury 层标识 {key} 限额 "
+                    f"{run.treasury_policy[key]} 不足：已占 {occupied}，"
+                    f"本笔 {record.amount}"
+                )
+        key = record.debtor_id
+        pending_self = (
+            run.debtor_usage.get(key, _ZERO)
+            - transferred_debtor.get(key, _ZERO)
+        )
+        occupied = (
+            run.snapshot_debtor.get(key, _ZERO)
+            + self._confirmed_debtor.get(key, _ZERO)
+            + self._reserved_debtor.get(key, _ZERO)
+            - pending_self
+        )
+        if occupied + record.amount > run.debtor_policy[key]:
+            raise InvalidSettlementBatchError(
+                f"确认预占时 debtor 层标识 {key} 限额 "
+                f"{run.debtor_policy[key]} 不足：已占 {occupied}，"
+                f"本笔 {record.amount}"
+            )
+
+    def _append_reservation_record_audit(
+        self,
+        run: _SettlementReservationRun,
+        result: SettlementRecordResult,
+    ) -> str:
+        """确认阶段把单条受理或拒绝记录追加为既有结构审计事件。
+
+        受理记录的未覆盖债权进入存续坏账台账（来源流水号取
+        ``settlement_id``），随后可被回收 / 核销按既有口径冲减；同时登记
+        业务流水号与 :class:`SettlementResult` 索引，使
+        :meth:`has_transaction` / :meth:`result_of` /
+        :meth:`bad_debt_trail` 与各坏账报告沿用既有语义。拒绝记录只计数、
+        不确认坏账。返回事件标识。
+        """
+        sid = result.settlement_id
+        approved = result.accepted
+        event_id = (
+            f"EVT-{sid}-{'approved' if approved else 'rejected'}"
+        )
+        self._sequence += 1
+        event = AuditEvent(
+            event_id=event_id,
+            sequence=self._sequence,
+            transaction_id=sid,
+            approved=approved,
+            currency=run.currency,
+            input_summary={
+                "settlement_id": sid,
+                "batch_id": run.batch_id,
+                "debtor_id": result.debtor_id,
+                "treasury_id": result.treasury_id,
+                "priority": result.priority,
+                "settlement_amount": result.amount,
+                "creditors": tuple(
+                    (attribution.creditor, attribution.claim_amount)
+                    for attribution in result.attributions
+                ),
+            },
+            validation_result="APPROVED" if approved else "REJECTED",
+            risk_occupancy=result.amount,
+            pool_allocations=tuple(
+                zip(result.creditors, result.pool_allocations, strict=True)
             ),
-            audit_events=tuple(events),
-            accepted_count=sum(1 for result in results if result.accepted),
-            rejected_count=sum(1 for result in results if not result.accepted),
+            capital_allocations=tuple(
+                zip(result.creditors, result.capital_allocations, strict=True)
+            ),
+            uncovered_bad_debt=result.uncovered_bad_debt,
+            validated_available_balance=_ZERO,
+            rejection_reason=(
+                None if approved else SETTLEMENT_REASON_LIMIT_EXCEEDED
+            ),
+        )
+        self._events.append(event)
+
+        settled_result = SettlementResult(
+            transaction_id=sid,
+            approved=approved,
+            validated_available_balance=_ZERO,
+            creditors=result.creditors,
+            pool_allocations=result.pool_allocations,
+            capital_allocations=result.capital_allocations,
+            attributions=result.attributions,
+            uncovered_bad_debt=result.uncovered_bad_debt,
+            risk_occupancy=result.amount,
+            event_id=event_id,
+            rejection_reason=(
+                None if approved else SETTLEMENT_REASON_LIMIT_EXCEEDED
+            ),
+        )
+        self._results[sid] = settled_result
+        self._seen_transactions.add(sid)
+
+        if approved:
+            for attribution in result.attributions:
+                if attribution.bad_debt > _ZERO:
+                    self._bad_debt_ledger.append(
+                        _BadDebtEntry(
+                            source_transaction_id=sid,
+                            creditor=attribution.creditor,
+                            currency=run.currency,
+                            remaining=attribution.bad_debt,
+                        )
+                    )
+        return event_id
+
+    @staticmethod
+    def _build_reservation(
+        run: _SettlementReservationRun,
+        reservation_id: str,
+        *,
+        event_ids: tuple[str, ...] = (),
+    ) -> SettlementReservation:
+        """从内部预占记录组装不可变公开结果。"""
+        return SettlementReservation(
+            reservation_id=reservation_id,
+            state=run.state,
+            batch_id=run.batch_id,
+            currency=run.currency,
+            results=run.results,
+            treasury_limits=run.treasury_limits,
+            debtor_limits=run.debtor_limits,
+            audit_events=run.events,
+            accepted_count=sum(1 for result in run.results if result.accepted),
+            rejected_count=sum(
+                1 for result in run.results if not result.accepted
+            ),
+            event_ids=event_ids,
         )
 
     @staticmethod

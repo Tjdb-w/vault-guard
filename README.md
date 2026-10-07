@@ -331,6 +331,73 @@ evaluation = engine.evaluate_settlement_batch(
   `InvalidSettlementAmountError`；`priority` 非整数 →
   `InvalidSettlementPriorityError`。
 
+## 组合限额两阶段占用：预占 / 确认 / 取消
+
+`reserve_settlement_batch` / `confirm_settlement_batch` /
+`cancel_settlement_batch` 在 `evaluate_settlement_batch` 的试算口径之上
+把组合限额预占落到引擎内存，提供“先占两层额度，再确认或取消”的两阶段
+语义（依赖引擎内跨预占状态，仅提供引擎方法，无模块级一次性入口）：
+
+```python
+reservation = engine.reserve_settlement_batch(
+    "RES-001",          # reservation_id：预占标识
+    "BATCH-900", "USD", # 以下参数与 evaluate_settlement_batch 完全相同
+    {"treasury": {"T1": Decimal("50")}, "debtor": {"D1": Decimal("25")}},
+    {"treasury_limits": {"T1": Decimal("1000")},
+     "debtor_limits": {"D1": Decimal("500")}},
+    records,
+)
+
+confirmed = engine.confirm_settlement_batch("RES-001")   # 确认
+cancelled = engine.cancel_settlement_batch("RES-002")    # 或取消
+view = engine.get_settlement_reservation("RES-001")      # 只读查询
+```
+
+- **预占（reserve）**：排序、两层余量（边界取等号受理）、
+  `LIMIT_EXCEEDED` 整笔拒绝、清算瀑布、补充资本与坏账归因口径完全沿用
+  `evaluate_settlement_batch`。起始占额为外部 `reservation_snapshot`
+  **叠加引擎内全部活动预占与已确认占额**——后续 reserve 计入快照和未结
+  预占，已确认占额继续阻止超额；受理记录按层累计为活动预占，拒绝记录
+  不占额度（只计入返回快照的 `rejected_reserved`）。reserve 不写内存
+  审计台账、不确认坏账、不动资金池，本批全部 `settlement_id` 登记到
+  引擎内存。返回不可变 `SettlementReservation`：字段与
+  `SettlementBatchEvaluation` 同构，另含 `reservation_id`、`state`
+  （`RESERVED`）与空 `event_ids`；两层占额快照反映本次预占时刻。
+- **确认（confirm）**：把受理记录的两层占额由活动预占**转为已确认占额**，
+  逐条记录再次守住两层余量（起始口径同 reserve，含其他活动预占；余量
+  被挤占时抛 `InvalidSettlementBatchError`，且不产生任何转移、审计或
+  坏账，预占保持活动可重试）。每条受理或拒绝记录各追加一条既有结构
+  内存审计事件（序号继续递增）：受理为 `APPROVED`、事件标识
+  `EVT-{settlement_id}-approved`，未覆盖债权进入存续坏账台账，可由
+  `process_recovery` / `process_writeoff`（含定向版本）冲减 / 核销；
+  拒绝为 `REJECTED` + `LIMIT_EXCEEDED`，不确认坏账。瀑布分配、资本
+  承担、坏账归因及 recovery、writeoff、risk group、transaction_id
+  语义全部**复用 reserve 返回的结果**，不重新试算；`settlement_id`
+  同时登记为业务流水号，`result_of` / `has_transaction` /
+  `bad_debt_trail` / 各坏账报告与审计核对直接可见。返回同一不可变
+  结构的 `CONFIRMED` 版本，`event_ids` 与记录同序。
+- **取消（cancel）**：释放该预占全部活动预占（按层冲减受理占额）与本批
+  未确认的全部 `settlement_id`（受理与拒绝记录都释放，可被后续
+  evaluate / reserve 重新使用）；**不**生成审计、不确认坏账、不改资金
+  池或其他预占。返回 `CANCELLED` 版本，预占仍以终态保留，重复使用同一
+  `reservation_id` 仍判重复。
+- **状态机**：确认后不能取消，取消后不能确认；对 `CONFIRMED` /
+  `CANCELLED` 终态再次确认或取消抛 `SettlementReservationStateError`。
+- **只读查询**：`get_settlement_reservation(reservation_id)` 返回不可变
+  `SettlementReservationView`，只含 `reservation_id`、`state`、
+  `batch_id`、`currency`、按处理顺序排列的 `reason_codes` 与建立预占时
+  的两层 `LimitReservation` 占额快照；不重算占额、不生成事件、不改状态，
+  未知标识抛 `SettlementReservationNotFoundError`。
+- **异常**：`reservation_id` 缺失或去首尾空白后为空 →
+  `InvalidSettlementReservationError`；与既有预占（含终态）重复 →
+  `DuplicateSettlementReservationError`；confirm / cancel / 查询引用
+  未知标识 → `SettlementReservationNotFoundError`；终态误操作 →
+  `SettlementReservationStateError`。reserve 的其余输入异常（批次标识 /
+  币种 / 风险策略、`settlement_id` 批内或跨批次重复、策略未登记、币种
+  不一致、金额、优先级等）与异常顺序完全沿用
+  `evaluate_settlement_batch`。**校验失败不产生占额、审计、坏账或标识
+  登记**（`reservation_id` 也不登记），修正后可用同一标识整体重提。
+
 ## 处理规则（确定顺序）
 
 1. **输入校验**：负数金额/余额、重复流水号、缺币种、空债权清单、系数越界
@@ -542,6 +609,10 @@ rows = engine.risk_group_bad_debt_report("USD")
 | 记录币种与批次币种不一致 | `vault_guard.CurrencyMismatchError` |
 | 结算金额非有限正数 | `vault_guard.InvalidSettlementAmountError` |
 | 结算优先级非整数 | `vault_guard.InvalidSettlementPriorityError` |
+| 预占标识缺失或为空 | `vault_guard.InvalidSettlementReservationError` |
+| 预占标识重复 | `vault_guard.DuplicateSettlementReservationError` |
+| 未知预占标识 | `vault_guard.SettlementReservationNotFoundError` |
+| 终态预占误操作（确认后取消 / 取消后确认 / 终态再操作） | `vault_guard.SettlementReservationStateError` |
 
 校验异常不产生任何半成品分配，也不写入审计台账；失败请求的流水号不被占用，
 可在修正后用同一流水号重新提交。
@@ -560,7 +631,8 @@ rows = engine.risk_group_bad_debt_report("USD")
   `engine.creditor_bad_debt_report(currency, creditor_names=None)`、
   `engine.bad_debt_trail(transaction_id)`、
   `engine.risk_group_bad_debt_report(currency)`、
-  `engine.has_transaction(transaction_id)`。
+  `engine.has_transaction(transaction_id)`、
+  `engine.get_settlement_reservation(reservation_id)`。
 
 ### 单币种审计核对快照
 

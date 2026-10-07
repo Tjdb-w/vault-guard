@@ -45,6 +45,11 @@ __all__ = [
     "SettlementBatchEvaluation",
     "SETTLEMENT_REASON_ACCEPTED",
     "SETTLEMENT_REASON_LIMIT_EXCEEDED",
+    "SettlementReservation",
+    "SettlementReservationView",
+    "RESERVATION_STATE_RESERVED",
+    "RESERVATION_STATE_CONFIRMED",
+    "RESERVATION_STATE_CANCELLED",
 ]
 
 
@@ -711,3 +716,67 @@ class SettlementBatchEvaluation:
     audit_events: tuple[SettlementAuditEvent, ...]
     accepted_count: int
     rejected_count: int
+
+
+# --------------------------------------------------------------------------- #
+# 组合限额两阶段占用（reserve / confirm / cancel）
+# --------------------------------------------------------------------------- #
+
+# 预占已建立、尚未确认或取消。
+RESERVATION_STATE_RESERVED = "RESERVED"
+# 预占已确认：预留额转为已确认占额，记录已写内存审计台账。
+RESERVATION_STATE_CONFIRMED = "CONFIRMED"
+# 预占已取消：活动预占已释放，未确认的 settlement_id 已解除登记。
+RESERVATION_STATE_CANCELLED = "CANCELLED"
+
+
+@dataclass(frozen=True)
+class SettlementReservation:
+    """组合限额两阶段占用的不可变预占结果（reserve 的返回结构）。
+
+    结构与 :class:`SettlementBatchEvaluation` 同构（同名字段同义），另含：
+
+    - ``reservation_id``：本次预占标识。
+    - ``state``：建立时固定为 :data:`RESERVATION_STATE_RESERVED`。
+    - ``event_ids``：空元组——预占不写内存审计台账；确认后每条受理或拒绝
+      记录各追加一条既有结构审计事件，其标识在 confirm 的返回结构中给出。
+
+    两层占额快照（``treasury_limits`` / ``debtor_limits``）只反映本次预占
+    的期初（含其他活动预占与已确认占额）与受理 / 拒绝统计；后续预占会计入
+    更新后的快照与未结预占。
+    """
+
+    reservation_id: str
+    state: str
+    batch_id: str
+    currency: str
+    results: tuple[SettlementRecordResult, ...]
+    treasury_limits: Mapping[str, LimitReservation]
+    debtor_limits: Mapping[str, LimitReservation]
+    audit_events: tuple[SettlementAuditEvent, ...]
+    accepted_count: int
+    rejected_count: int
+    event_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class SettlementReservationView:
+    """预占只读查询结果（不可变），只暴露状态与占额事实。
+
+    - ``reservation_id`` / ``state``：预占标识与当前状态（``RESERVED`` /
+      ``CONFIRMED`` / ``CANCELLED``）。
+    - ``batch_id`` / ``currency``：预占归属的批次与币种。
+    - ``reason_codes``：按处理顺序排列的每条记录原因码（``ACCEPTED`` /
+      ``LIMIT_EXCEEDED``）元组，与预占结果同序。
+    - ``treasury_limits`` / ``debtor_limits``：建立预占时的两层占额快照
+      （:class:`LimitReservation` 只读映射）；查询不重算占额，只回传预占
+      时刻的不可变快照。
+    """
+
+    reservation_id: str
+    state: str
+    batch_id: str
+    currency: str
+    reason_codes: tuple[str, ...]
+    treasury_limits: Mapping[str, LimitReservation]
+    debtor_limits: Mapping[str, LimitReservation]
