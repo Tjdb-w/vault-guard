@@ -20,6 +20,10 @@
   状态，仅提供引擎方法，无模块级一次性入口）；
 - :meth:`ClearingEngine.process_writeoff`：存续坏账核销入口（核销依赖台账
   状态，仅提供引擎方法，无模块级一次性入口）；
+- :meth:`ClearingEngine.process_targeted_recovery` /
+  :meth:`ClearingEngine.process_targeted_writeoff`：定向坏账回收 / 核销
+  入口（按币种、来源结算流水号与债权人定位唯一存续明细，仅提供引擎
+  方法）；
 - :meth:`ClearingEngine.creditor_bad_debt_report`：债权人维度只读坏账
   报告入口（按债权人合并多来源坏账，返回不可变
   :class:`~vault_guard.models.CreditorBadDebtSummary` 元组，不新增事件、

@@ -60,6 +60,15 @@
 （序号继续递增，``writeoff_allocations`` 保存同额明细；结算与回收事件
 该字段恒为空元组），失败不生成事件、不占流水号、不改状态。
 
+定向坏账回收与核销（:meth:`ClearingEngine.process_targeted_recovery` /
+:meth:`ClearingEngine.process_targeted_writeoff`）在既有回收 / 核销之上
+按币种、来源结算流水号（精确匹配）与债权人名称（去首尾空白后匹配）
+定位唯一仍有余额的存续明细并只处理该明细，可部分覆盖，不影响同来源
+其他债权人或其他来源同名债权；结果与事件口径沿用既有回收 / 核销
+（``allocations`` 只含命中明细，零额处理在目标有余额时生成空明细事件），
+校验顺序为操作流水号及全局重复、币种、来源与债权人、金额、目标明细、
+余额上限，失败不生成事件、不占流水号、不改状态。
+
 债权人维度坏账报告（:meth:`ClearingEngine.creditor_bad_debt_report`）是
 只读查询：按债权人合并该币种下跨事件、跨来源结算的坏账记录，返回不可变
 :class:`CreditorBadDebtSummary` 元组。仅收录放行归因坏账大于零的债权人，
@@ -1691,6 +1700,222 @@ class ClearingEngine:
             writeoff_amount=amount,
             allocations=tuple(allocations),
             total_written_off=amount - remaining,
+            outstanding_bad_debt=outstanding_after,
+            event_id=event_id,
+        )
+        self._append_writeoff_audit(result)
+        self._writeoffs[writeoff_transaction_id] = result
+        return result
+
+    def _find_targeted_entry(
+        self, currency: str, source_transaction_id: str, creditor: str
+    ) -> _BadDebtEntry | None:
+        """按币种、来源结算流水号（精确匹配）与债权人（去首尾空白后匹配）
+        定位仍有余额的唯一存续坏账明细；未命中返回 ``None``。"""
+        for entry in self._bad_debt_ledger:
+            if (
+                entry.currency == currency
+                and entry.source_transaction_id == source_transaction_id
+                and entry.creditor == creditor
+                and entry.remaining > _ZERO
+            ):
+                return entry
+        return None
+
+    def process_targeted_recovery(
+        self,
+        recovery_transaction_id: str,
+        currency: str,
+        source_transaction_id: str,
+        creditor: str,
+        recovery_amount: Number,
+    ) -> RecoveryResult:
+        """提交一笔定向存续坏账回收，返回不可变 :class:`RecoveryResult`。
+
+        只冲减币种相符、来源结算流水号精确匹配、债权人名称去首尾空白后
+        匹配且仍有余额的唯一明细，可部分覆盖；不影响同来源其他债权人或
+        其他来源同名债权的明细。``allocations`` 只含该命中明细，
+        ``total_recovered`` 等于处理额，``outstanding_bad_debt`` 为该币种
+        处理后的存续余额。历史 :class:`SettlementResult` 不回写。
+
+        校验顺序：操作流水号（非空字符串、全局不重复）-> 币种 ->
+        来源流水号与债权人（非空字符串）-> 金额（非负数值）-> 目标明细
+        存在 -> 不超过该明细余额。对应异常依次为内建
+        :class:`ValueError` / :class:`DuplicateTransactionError`、
+        :class:`InvalidCurrencyError`、内建 :class:`ValueError`、内建
+        :class:`ValueError`、:class:`NoOutstandingBadDebtError`、
+        :class:`RecoveryAmountExceedsOutstandingError`。
+
+        失败不生成事件、不占流水号、不改状态。目标有余额时零额回收合法，
+        生成一条空明细事件，标识为 ``EVT-{recovery_transaction_id}-recovery``，
+        审计序号继续递增。
+        """
+        if not isinstance(recovery_transaction_id, str) or not recovery_transaction_id.strip():
+            raise ValueError("recovery_transaction_id 必须是非空字符串")
+
+        # 重复流水号：在任何归一化/状态变更之前判定。
+        if recovery_transaction_id in self._seen_transactions:
+            raise DuplicateTransactionError(
+                f"重复的业务流水号: {recovery_transaction_id}"
+            )
+
+        if not isinstance(currency, str) or not currency.strip():
+            raise InvalidCurrencyError("账户币种缺失或为空")
+        currency = currency.strip()
+
+        if not isinstance(source_transaction_id, str) or not source_transaction_id.strip():
+            raise ValueError("source_transaction_id 必须是非空字符串")
+        if not isinstance(creditor, str) or not creditor.strip():
+            raise ValueError("creditor 必须是非空字符串")
+        creditor = creditor.strip()
+
+        amount = _as_decimal(recovery_amount, "recovery_amount")
+        _check_non_negative(amount, "recovery_amount")
+
+        entry = self._find_targeted_entry(
+            currency, source_transaction_id, creditor
+        )
+        if entry is None:
+            raise NoOutstandingBadDebtError(
+                f"币种 {currency} 来源 {source_transaction_id} 债权人 "
+                f"{creditor} 无存续坏账可回收"
+            )
+        if amount > entry.remaining:
+            raise RecoveryAmountExceedsOutstandingError(
+                f"回收额 {amount} 超过该明细存续坏账 {entry.remaining}"
+            )
+
+        # 校验全部通过后才登记流水号并执行冲减。
+        self._seen_transactions.add(recovery_transaction_id)
+
+        allocations: list[RecoveryAllocation] = []
+        if amount > _ZERO:
+            entry.remaining -= amount
+            allocations.append(
+                RecoveryAllocation(
+                    source_transaction_id=entry.source_transaction_id,
+                    creditor=entry.creditor,
+                    recovered_amount=amount,
+                    remaining_bad_debt=entry.remaining,
+                )
+            )
+
+        outstanding_after = sum(
+            (
+                item.remaining
+                for item in self._bad_debt_ledger
+                if item.currency == currency
+            ),
+            _ZERO,
+        )
+        event_id = f"EVT-{recovery_transaction_id}-recovery"
+        result = RecoveryResult(
+            recovery_transaction_id=recovery_transaction_id,
+            currency=currency,
+            recovery_amount=amount,
+            allocations=tuple(allocations),
+            total_recovered=amount,
+            outstanding_bad_debt=outstanding_after,
+            event_id=event_id,
+        )
+        self._append_recovery_audit(result)
+        self._recoveries[recovery_transaction_id] = result
+        return result
+
+    def process_targeted_writeoff(
+        self,
+        writeoff_transaction_id: str,
+        currency: str,
+        source_transaction_id: str,
+        creditor: str,
+        writeoff_amount: Number,
+    ) -> WriteoffResult:
+        """提交一笔定向存续坏账核销，返回不可变 :class:`WriteoffResult`。
+
+        只核销币种相符、来源结算流水号精确匹配、债权人名称去首尾空白后
+        匹配且仍有余额的唯一明细，可部分覆盖；不影响同来源其他债权人或
+        其他来源同名债权的明细。``allocations`` 只含该命中明细，
+        ``total_written_off`` 等于处理额，``outstanding_bad_debt`` 为该
+        币种处理后的存续余额。核销只减少存续坏账，不改其他状态；历史
+        :class:`SettlementResult` 不回写。
+
+        校验顺序：操作流水号（非空字符串、全局不重复）-> 币种 ->
+        来源流水号与债权人（非空字符串）-> 金额（非负数值）-> 目标明细
+        存在 -> 不超过该明细余额。对应异常依次为内建
+        :class:`ValueError` / :class:`DuplicateTransactionError`、
+        :class:`InvalidCurrencyError`、内建 :class:`ValueError`、内建
+        :class:`ValueError`、:class:`NoOutstandingBadDebtError`、
+        :class:`WriteoffAmountExceedsOutstandingError`。
+
+        失败不生成事件、不占流水号、不改状态。目标有余额时零额核销合法，
+        生成一条空明细事件，标识为 ``EVT-{writeoff_transaction_id}-writeoff``，
+        审计序号继续递增。
+        """
+        if not isinstance(writeoff_transaction_id, str) or not writeoff_transaction_id.strip():
+            raise ValueError("writeoff_transaction_id 必须是非空字符串")
+
+        # 重复流水号：在任何归一化/状态变更之前判定。
+        if writeoff_transaction_id in self._seen_transactions:
+            raise DuplicateTransactionError(
+                f"重复的业务流水号: {writeoff_transaction_id}"
+            )
+
+        if not isinstance(currency, str) or not currency.strip():
+            raise InvalidCurrencyError("账户币种缺失或为空")
+        currency = currency.strip()
+
+        if not isinstance(source_transaction_id, str) or not source_transaction_id.strip():
+            raise ValueError("source_transaction_id 必须是非空字符串")
+        if not isinstance(creditor, str) or not creditor.strip():
+            raise ValueError("creditor 必须是非空字符串")
+        creditor = creditor.strip()
+
+        amount = _as_decimal(writeoff_amount, "writeoff_amount")
+        _check_non_negative(amount, "writeoff_amount")
+
+        entry = self._find_targeted_entry(
+            currency, source_transaction_id, creditor
+        )
+        if entry is None:
+            raise NoOutstandingBadDebtError(
+                f"币种 {currency} 来源 {source_transaction_id} 债权人 "
+                f"{creditor} 无存续坏账可核销"
+            )
+        if amount > entry.remaining:
+            raise WriteoffAmountExceedsOutstandingError(
+                f"核销额 {amount} 超过该明细存续坏账 {entry.remaining}"
+            )
+
+        # 校验全部通过后才登记流水号并执行核销。
+        self._seen_transactions.add(writeoff_transaction_id)
+
+        allocations: list[WriteoffAllocation] = []
+        if amount > _ZERO:
+            entry.remaining -= amount
+            allocations.append(
+                WriteoffAllocation(
+                    source_transaction_id=entry.source_transaction_id,
+                    creditor=entry.creditor,
+                    written_off_amount=amount,
+                    remaining_bad_debt=entry.remaining,
+                )
+            )
+
+        outstanding_after = sum(
+            (
+                item.remaining
+                for item in self._bad_debt_ledger
+                if item.currency == currency
+            ),
+            _ZERO,
+        )
+        event_id = f"EVT-{writeoff_transaction_id}-writeoff"
+        result = WriteoffResult(
+            writeoff_transaction_id=writeoff_transaction_id,
+            currency=currency,
+            writeoff_amount=amount,
+            allocations=tuple(allocations),
+            total_written_off=amount,
             outstanding_bad_debt=outstanding_after,
             event_id=event_id,
         )
