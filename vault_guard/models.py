@@ -39,6 +39,12 @@ __all__ = [
     "BATCH_INVALID_REASON_MISSING_BATCH_ID",
     "BATCH_INVALID_REASON_MISSING_EXECUTION_ID",
     "BATCH_INVALID_REASON_UNCOMPUTABLE_DIGEST",
+    "LimitReservation",
+    "SettlementRecordResult",
+    "SettlementAuditEvent",
+    "SettlementBatchEvaluation",
+    "SETTLEMENT_REASON_ACCEPTED",
+    "SETTLEMENT_REASON_LIMIT_EXCEEDED",
 ]
 
 
@@ -593,3 +599,115 @@ class BatchIdentifierInvalid:
     reason: str
     batch_id: str | None = None
     outcome: str = BATCH_OUTCOME_INVALID_IDENTIFIER
+
+
+# --------------------------------------------------------------------------- #
+# 清算批次组合限额试算（evaluate_settlement_batch）
+# --------------------------------------------------------------------------- #
+
+# 受理记录的机器可读原因码。
+SETTLEMENT_REASON_ACCEPTED = "ACCEPTED"
+# 单层限额不足导致整笔拒绝的机器可读原因码（可预期拒绝，不抛异常）。
+SETTLEMENT_REASON_LIMIT_EXCEEDED = "LIMIT_EXCEEDED"
+
+
+@dataclass(frozen=True)
+class LimitReservation:
+    """单层累计占额限额在批次试算后的快照（不可变）。
+
+    - ``limit``：风险策略为该标识登记的非负上限；标识仅出现在占额快照而
+      策略未登记时为 ``None``。
+    - ``initial_reserved``：占额快照给出的期初已占额度（缺省为 0）。
+    - ``accepted_reserved``：本批次受理记录累计预占的额度。
+    - ``rejected_reserved``：本批次引用该限额但被整笔拒绝的记录金额合计
+      （拒绝不占用额度，仅作审计统计）。
+    - ``final_reserved``：``initial_reserved + accepted_reserved``，
+      即批次试算后的累计占额。
+    """
+
+    limit: Decimal | None
+    initial_reserved: Decimal
+    accepted_reserved: Decimal
+    rejected_reserved: Decimal
+    final_reserved: Decimal
+
+
+@dataclass(frozen=True)
+class SettlementRecordResult:
+    """清算批次中单条记录的试算结果（不可变），受理与拒绝同构。
+
+    - ``settlement_id`` / ``debtor_id`` / ``treasury_id`` / ``priority`` /
+      ``amount``：归一化后的记录事实（``treasury_id`` 可缺省为 ``None``）。
+    - ``accepted``：两层限额均有余量时整笔受理。
+    - ``reason_code``：``ACCEPTED`` 或 ``LIMIT_EXCEEDED``。
+    - ``creditors`` / ``pool_allocations`` / ``capital_allocations`` /
+      ``attributions`` / ``uncovered_bad_debt``：清算瀑布集合与坏账归因，
+      口径同 :class:`SettlementResult`；拒绝记录不进瀑布，各层分配全为 0、
+      不确认坏账。
+    """
+
+    settlement_id: str
+    debtor_id: str
+    treasury_id: str | None
+    priority: int
+    amount: Decimal
+    accepted: bool
+    reason_code: str
+    creditors: tuple[str, ...]
+    pool_allocations: tuple[Decimal, ...]
+    capital_allocations: tuple[Decimal, ...]
+    attributions: tuple[CreditorAttribution, ...]
+    uncovered_bad_debt: Decimal
+
+    @property
+    def total_pool_allocated(self) -> Decimal:
+        return sum(self.pool_allocations, Decimal(0))
+
+    @property
+    def total_capital_allocated(self) -> Decimal:
+        return sum(self.capital_allocations, Decimal(0))
+
+
+@dataclass(frozen=True)
+class SettlementAuditEvent:
+    """清算批次试算的一条 reason_code 审计事件（不可变）。
+
+    每条记录（受理或拒绝）恰好产生一条事件；``sequence`` 为批内按处理
+    顺序（priority 升序、同优先级按 settlement_id 码点升序）从 1 递增的
+    序号。事件只随试算结果返回，不写入引擎的既有审计台账。
+    """
+
+    event_id: str
+    sequence: int
+    batch_id: str
+    settlement_id: str
+    accepted: bool
+    reason_code: str
+    amount: Decimal
+    debtor_id: str
+    treasury_id: str | None
+    priority: int
+
+
+@dataclass(frozen=True)
+class SettlementBatchEvaluation:
+    """清算批次组合限额试算的公开返回结构（不可变）。
+
+    - ``batch_id`` / ``currency``：归一化后的批次标识与币种。
+    - ``results``：按处理顺序（priority 升序、同优先级按 settlement_id
+      码点升序）排列的逐记录 :class:`SettlementRecordResult`。
+    - ``treasury_limits`` / ``debtor_limits``：两层各标识到
+      :class:`LimitReservation` 的只读映射，覆盖风险策略与占额快照中
+      出现的全部标识，按标识码点升序排列。
+    - ``audit_events``：与 ``results`` 同序的 reason_code 审计事件。
+    - ``accepted_count`` / ``rejected_count``：受理 / 拒绝记录数。
+    """
+
+    batch_id: str
+    currency: str
+    results: tuple[SettlementRecordResult, ...]
+    treasury_limits: Mapping[str, LimitReservation]
+    debtor_limits: Mapping[str, LimitReservation]
+    audit_events: tuple[SettlementAuditEvent, ...]
+    accepted_count: int
+    rejected_count: int

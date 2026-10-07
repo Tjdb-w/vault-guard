@@ -115,6 +115,17 @@ outstanding_bad_debt``（与 :meth:`outstanding_bad_debts` 该债权人余额
 推进，其余等待同一最终结果。三类入口仅提供引擎方法，状态只在实例内存中
 保留。
 
+清算批次组合限额试算（:meth:`ClearingEngine.evaluate_settlement_batch`）
+以占额快照与风险策略为输入，对 ``treasury_id`` 与 ``debtor_id`` 两层
+累计占额做预占试算：记录按 ``priority`` 升序、同优先级按
+``settlement_id`` 码点升序处理，先加快照占额再加受理金额，两层限额都
+有余量才整笔受理，任一不足以 ``LIMIT_EXCEEDED`` 整笔拒绝（不部分受理、
+不进瀑布、不产生坏账、不改占额）。返回批次标识、逐记录受理结果、每层
+限额的期初 / 受理 / 拒绝 / 期末占额、瀑布与坏账归因及 reason_code 审计
+事件。输入只服务本次调用：不写资金池、坏账台账、审计台账、风险组额度
+或流水号登记，仅把本批 ``settlement_id`` 登记到引擎内存用于跨批次去重；
+不新增文件、数据库表或消息约定。
+
 校验异常不产生任何分配，也不写入台账；重复流水号在任何状态变更之前抛出。
 """
 
@@ -129,15 +140,21 @@ from types import MappingProxyType
 from typing import Union
 
 from .errors import (
+    CurrencyMismatchError,
+    DuplicateSettlementIdError,
     DuplicateTransactionError,
     EmptyBatchError,
     EmptyCreditorListError,
     InvalidCurrencyError,
     InvalidRiskFactorError,
     InvalidRiskGroupError,
+    InvalidSettlementAmountError,
+    InvalidSettlementBatchError,
+    InvalidSettlementPriorityError,
     MixedCurrencyError,
     NoOutstandingBadDebtError,
     RecoveryAmountExceedsOutstandingError,
+    RiskPolicyNotFoundError,
     WriteoffAmountExceedsOutstandingError,
 )
 from .models import (
@@ -155,6 +172,7 @@ from .models import (
     CreditorAttribution,
     CreditorBadDebtSummary,
     CurrencyAuditSummary,
+    LimitReservation,
     MulticurrencyBatchResult,
     MulticurrencyBatchPreviewResult,
     OutstandingBadDebt,
@@ -164,7 +182,12 @@ from .models import (
     RiskGroupBatchPreviewResult,
     RiskGroupBadDebtSummary,
     RiskGroupUsage,
+    SETTLEMENT_REASON_ACCEPTED,
+    SETTLEMENT_REASON_LIMIT_EXCEEDED,
+    SettlementAuditEvent,
+    SettlementBatchEvaluation,
     SettlementPreview,
+    SettlementRecordResult,
     SettlementRequest,
     SettlementResult,
     WriteoffAllocation,
@@ -309,6 +332,19 @@ class _BatchRun:
     completed_items: list[SettlementResult] = field(default_factory=list)
     result: object = None
     done_event: Lock = field(default_factory=Lock)
+
+
+@dataclass
+class _SettlementRecord:
+    """清算批次试算中归一化后的单条记录（引擎私有，可变）。"""
+
+    settlement_id: str
+    debtor_id: str
+    treasury_id: str | None
+    priority: int
+    amount: Decimal
+    creditors: tuple[Creditor, ...]
+    supplementary_capital: Decimal
 
 
 def _stable_json(value: object) -> str:
@@ -459,6 +495,9 @@ class ClearingEngine:
         # 登记 / 冲突判定，每批次各自的锁串行并发提交。
         self._batch_runs: dict[str, _BatchRun] = {}
         self._batch_registry_lock = Lock()
+        # 清算批次试算已登记的结算标识（跨调用去重；仅此一项跨调用保留，
+        # 占额快照、风险策略与记录等输入只服务当次调用）。
+        self._seen_settlement_ids: set[str] = set()
 
     # ------------------------------------------------------------------ #
     # 只读查询（不触发清算，不改变任何状态）
@@ -1428,6 +1467,503 @@ class ClearingEngine:
         return MulticurrencyBatchPreviewResult(
             results=tuple(results),
             validated_available_balances=MappingProxyType(working),
+        )
+
+    # ------------------------------------------------------------------ #
+    # 清算批次组合限额试算
+    # ------------------------------------------------------------------ #
+
+    def evaluate_settlement_batch(
+        self,
+        batch_id: str,
+        currency: str,
+        reservation_snapshot: Mapping[str, Mapping[str, Number]] | None,
+        risk_policy: Mapping[str, Mapping[str, Number]],
+        records: Iterable[Mapping[str, object]],
+    ) -> SettlementBatchEvaluation:
+        """对清算批次做组合限额预占与确定性试算，返回不可变
+        :class:`SettlementBatchEvaluation`。
+
+        - ``batch_id``：批次标识，非空字符串（去首尾空白）。
+        - ``currency``：批次币种，适用于批次内全部记录。
+        - ``reservation_snapshot``：占额快照，``{"treasury": {标识: 已占额},
+          "debtor": {标识: 已占额}}``；``None`` 或子表缺省视为空快照。
+          试算从快照占额起算，再逐笔累计受理金额。
+        - ``risk_policy``：风险策略，
+          ``{"treasury_limits": {treasury_id: 上限},
+          "debtor_limits": {debtor_id: 上限}}``；上限为非负有限数值，
+          子表缺省视为空表。
+        - ``records``：记录映射序列，每项含 ``settlement_id`` /
+          ``debtor_id`` / ``amount`` / ``priority``，``treasury_id`` 可选；
+          另可携带 ``currency``（缺省视为批次币种）、``creditors``（债权
+          清单，三种既有形式，缺省为空）与 ``supplementary_capital``
+          （默认 0）。
+
+        处理规则：
+
+        1. 记录按 ``priority`` 升序、同优先级按 ``settlement_id`` 的
+           Unicode 码点升序处理；相同输入结果一致。
+        2. 逐笔先加快照占额再加本批已受理金额：``treasury_id`` 存在时
+           treasury 层与 debtor 层限额都有余量才整笔受理（边界取等号
+           受理）；任一层不足则整笔拒绝，``reason_code`` 为
+           ``LIMIT_EXCEEDED``，不得部分受理。``treasury_id`` 缺省的记录
+           只占用 debtor 层。
+        3. 受理记录按既有清算瀑布以 ``amount`` 为资金池、
+           ``supplementary_capital`` 补足未受偿债权并归因坏账；拒绝记录
+           不进瀑布、不产生坏账、不改占额，也不影响后续记录。
+        4. 每条记录（受理或拒绝）各产生一条 reason_code 审计事件，随
+           结果返回；单层限额不足是可预期拒绝，不抛异常。
+
+        本入口为确定性试算：占额快照、风险策略与记录等输入只服务本次
+        调用，不写资金池、坏账台账、审计台账、风险组额度或流水号登记；
+        仅把本批全部 ``settlement_id`` 登记到引擎内存用于跨批次去重。
+        不新增文件、数据库表或消息约定。
+
+        异常（不产生受理、坏账或审计结果，也不登记任何结算标识）：
+
+        - 缺批次标识、币种或风险策略，或请求结构非法：
+          :class:`InvalidSettlementBatchError`；
+        - ``settlement_id`` 批内重复或与已登记标识重复：
+          :class:`DuplicateSettlementIdError`；
+        - 记录引用的 ``treasury_id`` / ``debtor_id`` 未在风险策略中
+          登记限额：:class:`RiskPolicyNotFoundError`；
+        - 记录币种与批次币种不一致：:class:`CurrencyMismatchError`；
+        - ``amount`` 非有限正数：:class:`InvalidSettlementAmountError`；
+        - ``priority`` 非整数：:class:`InvalidSettlementPriorityError`。
+        """
+        if not isinstance(batch_id, str) or not batch_id.strip():
+            raise InvalidSettlementBatchError("批次标识缺失或为空")
+        batch_id = batch_id.strip()
+        if not isinstance(currency, str) or not currency.strip():
+            raise InvalidSettlementBatchError("批次币种缺失或为空")
+        currency = currency.strip()
+
+        if not isinstance(risk_policy, Mapping):
+            raise InvalidSettlementBatchError("风险策略缺失或不是映射")
+        treasury_limits = self._normalize_reservation_table(
+            risk_policy.get("treasury_limits"),
+            "risk_policy.treasury_limits",
+        )
+        debtor_limits = self._normalize_reservation_table(
+            risk_policy.get("debtor_limits"),
+            "risk_policy.debtor_limits",
+        )
+
+        if reservation_snapshot is None:
+            reservation_snapshot = {}
+        if not isinstance(reservation_snapshot, Mapping):
+            raise InvalidSettlementBatchError("占额快照必须是映射")
+        snapshot_treasury = self._normalize_reservation_table(
+            reservation_snapshot.get("treasury"),
+            "reservation_snapshot.treasury",
+        )
+        snapshot_debtor = self._normalize_reservation_table(
+            reservation_snapshot.get("debtor"),
+            "reservation_snapshot.debtor",
+        )
+
+        if records is None:
+            raise InvalidSettlementBatchError("记录列表缺失")
+        try:
+            items = list(records)
+        except TypeError:
+            raise InvalidSettlementBatchError("记录列表不可迭代") from None
+
+        # 结算标识结构与重复判定：批内互相重复或与已登记标识重复均拒绝。
+        seen_in_batch: set[str] = set()
+        for index, item in enumerate(items):
+            if not isinstance(item, Mapping):
+                raise InvalidSettlementBatchError(
+                    f"records[{index}] 必须是字段映射，收到 "
+                    f"{type(item).__name__}"
+                )
+            settlement_id = item.get("settlement_id")
+            if not isinstance(settlement_id, str) or not settlement_id.strip():
+                raise InvalidSettlementBatchError(
+                    f"records[{index}] 缺少有效 settlement_id"
+                )
+            if (
+                settlement_id in seen_in_batch
+                or settlement_id in self._seen_settlement_ids
+            ):
+                raise DuplicateSettlementIdError(
+                    f"重复的结算标识: {settlement_id}"
+                )
+            seen_in_batch.add(settlement_id)
+
+        # 策略存在性：记录引用的每层标识都必须已在风险策略中登记限额。
+        for index, item in enumerate(items):
+            debtor_id = item.get("debtor_id")
+            if not isinstance(debtor_id, str) or not debtor_id.strip():
+                raise InvalidSettlementBatchError(
+                    f"records[{index}] 缺少有效 debtor_id"
+                )
+            if debtor_id.strip() not in debtor_limits:
+                raise RiskPolicyNotFoundError(
+                    f"records[{index}] 引用的 debtor_id "
+                    f"{debtor_id.strip()} 未在风险策略中登记限额"
+                )
+            treasury_id = item.get("treasury_id")
+            if treasury_id is not None:
+                if not isinstance(treasury_id, str) or not treasury_id.strip():
+                    raise InvalidSettlementBatchError(
+                        f"records[{index}] 的 treasury_id 必须是非空字符串"
+                    )
+                if treasury_id.strip() not in treasury_limits:
+                    raise RiskPolicyNotFoundError(
+                        f"records[{index}] 引用的 treasury_id "
+                        f"{treasury_id.strip()} 未在风险策略中登记限额"
+                    )
+
+        # 逐记录归一化：币种一致性、金额、优先级与结算字段。
+        normalized = [
+            self._normalize_settlement_record(item, index, currency)
+            for index, item in enumerate(items)
+        ]
+
+        # 处理顺序：priority 升序，相同 priority 按 settlement_id 码点升序。
+        ordered = sorted(
+            normalized, key=lambda record: (record.priority, record.settlement_id)
+        )
+
+        treasury_ids = set(treasury_limits) | set(snapshot_treasury)
+        debtor_ids = set(debtor_limits) | set(snapshot_debtor)
+        treasury_used = {
+            key: snapshot_treasury.get(key, _ZERO) for key in treasury_ids
+        }
+        debtor_used = {key: snapshot_debtor.get(key, _ZERO) for key in debtor_ids}
+        treasury_accepted = {key: _ZERO for key in treasury_ids}
+        treasury_rejected = {key: _ZERO for key in treasury_ids}
+        debtor_accepted = {key: _ZERO for key in debtor_ids}
+        debtor_rejected = {key: _ZERO for key in debtor_ids}
+
+        results: list[SettlementRecordResult] = []
+        events: list[SettlementAuditEvent] = []
+        for record in ordered:
+            treasury_ok = record.treasury_id is None or (
+                treasury_used[record.treasury_id] + record.amount
+                <= treasury_limits[record.treasury_id]
+            )
+            debtor_ok = (
+                debtor_used[record.debtor_id] + record.amount
+                <= debtor_limits[record.debtor_id]
+            )
+            accepted = treasury_ok and debtor_ok
+            if accepted:
+                if record.treasury_id is not None:
+                    treasury_used[record.treasury_id] += record.amount
+                    treasury_accepted[record.treasury_id] += record.amount
+                debtor_used[record.debtor_id] += record.amount
+                debtor_accepted[record.debtor_id] += record.amount
+                result = self._settle_settlement_record(record)
+                reason_code = SETTLEMENT_REASON_ACCEPTED
+            else:
+                # 整笔拒绝：不进瀑布、不产生坏账、不改占额，仅统计引用。
+                if record.treasury_id is not None:
+                    treasury_rejected[record.treasury_id] += record.amount
+                debtor_rejected[record.debtor_id] += record.amount
+                result = self._reject_settlement_record(record)
+                reason_code = SETTLEMENT_REASON_LIMIT_EXCEEDED
+            results.append(result)
+            events.append(
+                SettlementAuditEvent(
+                    event_id=(
+                        f"EVT-{record.settlement_id}-"
+                        f"{'accepted' if accepted else 'rejected'}"
+                    ),
+                    sequence=len(events) + 1,
+                    batch_id=batch_id,
+                    settlement_id=record.settlement_id,
+                    accepted=accepted,
+                    reason_code=reason_code,
+                    amount=record.amount,
+                    debtor_id=record.debtor_id,
+                    treasury_id=record.treasury_id,
+                    priority=record.priority,
+                )
+            )
+
+        # 试算全部完成后才登记结算标识：异常路径不产生任何登记。
+        self._seen_settlement_ids.update(
+            record.settlement_id for record in normalized
+        )
+
+        return SettlementBatchEvaluation(
+            batch_id=batch_id,
+            currency=currency,
+            results=tuple(results),
+            treasury_limits=MappingProxyType(
+                {
+                    key: LimitReservation(
+                        limit=treasury_limits.get(key),
+                        initial_reserved=snapshot_treasury.get(key, _ZERO),
+                        accepted_reserved=treasury_accepted[key],
+                        rejected_reserved=treasury_rejected[key],
+                        final_reserved=treasury_used[key],
+                    )
+                    for key in sorted(treasury_ids)
+                }
+            ),
+            debtor_limits=MappingProxyType(
+                {
+                    key: LimitReservation(
+                        limit=debtor_limits.get(key),
+                        initial_reserved=snapshot_debtor.get(key, _ZERO),
+                        accepted_reserved=debtor_accepted[key],
+                        rejected_reserved=debtor_rejected[key],
+                        final_reserved=debtor_used[key],
+                    )
+                    for key in sorted(debtor_ids)
+                }
+            ),
+            audit_events=tuple(events),
+            accepted_count=sum(1 for result in results if result.accepted),
+            rejected_count=sum(1 for result in results if not result.accepted),
+        )
+
+    @staticmethod
+    def _normalize_reservation_table(
+        raw: object, field: str
+    ) -> dict[str, Decimal]:
+        """归一化 标识 -> 非负金额 的占额 / 限额表；``None`` 视为空表，
+        一切非法输入抛 :class:`InvalidSettlementBatchError`。"""
+        if raw is None:
+            return {}
+        if not isinstance(raw, Mapping):
+            raise InvalidSettlementBatchError(f"{field} 必须是标识到金额的映射")
+        table: dict[str, Decimal] = {}
+        for raw_key, raw_value in raw.items():
+            if not isinstance(raw_key, str) or not raw_key.strip():
+                raise InvalidSettlementBatchError(
+                    f"{field} 的标识必须是非空字符串"
+                )
+            key = raw_key.strip()
+            try:
+                value = _as_decimal(raw_value, f"{field}[{key}]")
+            except ValueError as exc:
+                raise InvalidSettlementBatchError(str(exc)) from None
+            if value < _ZERO:
+                raise InvalidSettlementBatchError(
+                    f"{field}[{key}] 不得为负数，收到 {value}"
+                )
+            table[key] = value
+        return table
+
+    def _normalize_settlement_record(
+        self, item: Mapping[str, object], index: int, currency: str
+    ) -> _SettlementRecord:
+        """归一化清算批次试算的单条记录；结算标识、debtor / treasury
+        标识与重复判定已在前置阶段完成。"""
+        record_currency = item.get("currency")
+        if record_currency is not None:
+            if not isinstance(record_currency, str) or not record_currency.strip():
+                raise CurrencyMismatchError(f"records[{index}] 币种为空")
+            if record_currency.strip() != currency:
+                raise CurrencyMismatchError(
+                    f"批次币种 {currency} 与 records[{index}] 币种 "
+                    f"{record_currency.strip()} 不一致"
+                )
+
+        try:
+            amount = _as_decimal(item.get("amount"), f"records[{index}].amount")
+        except ValueError as exc:
+            raise InvalidSettlementAmountError(str(exc)) from None
+        if amount <= _ZERO:
+            raise InvalidSettlementAmountError(
+                f"records[{index}].amount 必须是正数，收到 {amount}"
+            )
+
+        priority = item.get("priority")
+        if isinstance(priority, bool) or not isinstance(priority, int):
+            raise InvalidSettlementPriorityError(
+                f"records[{index}].priority 必须是整数，收到 "
+                f"{type(priority).__name__}"
+            )
+
+        try:
+            capital = _as_decimal(
+                item.get("supplementary_capital", _ZERO),
+                f"records[{index}].supplementary_capital",
+            )
+        except ValueError as exc:
+            raise InvalidSettlementBatchError(str(exc)) from None
+        if capital < _ZERO:
+            raise InvalidSettlementBatchError(
+                f"records[{index}].supplementary_capital 不得为负数，"
+                f"收到 {capital}"
+            )
+
+        debtor_id = item["debtor_id"].strip()  # 前置阶段已校验
+        raw_treasury_id = item.get("treasury_id")
+        treasury_id = (
+            raw_treasury_id.strip() if raw_treasury_id is not None else None
+        )
+
+        return _SettlementRecord(
+            settlement_id=item["settlement_id"],
+            debtor_id=debtor_id,
+            treasury_id=treasury_id,
+            priority=priority,
+            amount=amount,
+            creditors=self._normalize_settlement_record_creditors(
+                item.get("creditors"), currency, index
+            ),
+            supplementary_capital=capital,
+        )
+
+    @staticmethod
+    def _normalize_settlement_record_creditors(
+        raw: object, currency: str, index: int
+    ) -> tuple[Creditor, ...]:
+        """归一化记录的债权清单（缺省或空清单返回空元组）；债权币种与
+        批次币种不一致抛 :class:`CurrencyMismatchError`，其余结构或
+        金额错误抛 :class:`InvalidSettlementBatchError`。"""
+        if raw is None:
+            return ()
+        try:
+            iterator = iter(raw)
+        except TypeError:
+            raise InvalidSettlementBatchError(
+                f"records[{index}].creditors 不可迭代"
+            ) from None
+
+        creditors: list[Creditor] = []
+        for c_index, entry in enumerate(iterator):
+            if isinstance(entry, Creditor):
+                name, claim, ccy = entry.name, entry.amount, entry.currency
+            elif isinstance(entry, Mapping):
+                name = entry.get("name")
+                claim = entry.get("amount")
+                ccy = entry.get("currency")
+            elif isinstance(entry, tuple):
+                if len(entry) == 2:
+                    name, claim = entry
+                    ccy = None
+                elif len(entry) == 3:
+                    name, claim, ccy = entry
+                else:
+                    raise InvalidSettlementBatchError(
+                        f"records[{index}] 第 {c_index} 项债权元组必须是 "
+                        f"(name, amount) 或 (name, amount, currency)"
+                    )
+            else:
+                raise InvalidSettlementBatchError(
+                    f"records[{index}] 第 {c_index} 项债权格式不被支持: "
+                    f"{type(entry).__name__}"
+                )
+
+            if not isinstance(name, str) or not name.strip():
+                raise InvalidSettlementBatchError(
+                    f"records[{index}] 第 {c_index} 项债权缺少有效名称"
+                )
+            try:
+                claim_dec = _as_decimal(
+                    claim, f"records[{index}].creditors[{c_index}].amount"
+                )
+            except ValueError as exc:
+                raise InvalidSettlementBatchError(str(exc)) from None
+            if claim_dec < _ZERO:
+                raise InvalidSettlementBatchError(
+                    f"records[{index}].creditors[{c_index}].amount 不得为负数，"
+                    f"收到 {claim_dec}"
+                )
+
+            if ccy is not None:
+                if not isinstance(ccy, str) or not ccy.strip():
+                    raise CurrencyMismatchError(
+                        f"records[{index}] 第 {c_index} 项债权币种为空"
+                    )
+                if ccy.strip() != currency:
+                    raise CurrencyMismatchError(
+                        f"批次币种 {currency} 与 records[{index}] 债权 "
+                        f"{name.strip()} 币种 {ccy.strip()} 不一致"
+                    )
+                ccy = ccy.strip()
+
+            creditors.append(
+                Creditor(name=name.strip(), amount=claim_dec, currency=ccy)
+            )
+        return tuple(creditors)
+
+    def _settle_settlement_record(
+        self, record: _SettlementRecord
+    ) -> SettlementRecordResult:
+        """受理路径：以记录金额为资金池执行清算瀑布并归因坏账。"""
+        creditors = record.creditors
+        pool_allocations = self._waterfall(creditors, record.amount)
+
+        residual_claims = [
+            creditor.amount - pool_allocations[i]
+            for i, creditor in enumerate(creditors)
+        ]
+        remaining_capital = record.supplementary_capital
+        capital_allocations: list[Decimal] = []
+        for residual in residual_claims:
+            share = min(residual, remaining_capital)
+            capital_allocations.append(share)
+            remaining_capital -= share
+
+        attributions: list[CreditorAttribution] = []
+        uncovered_total = _ZERO
+        for i, creditor in enumerate(creditors):
+            pool_share = pool_allocations[i]
+            capital_share = capital_allocations[i]
+            bad_debt = creditor.amount - pool_share - capital_share
+            uncovered_total += bad_debt
+            attributions.append(
+                CreditorAttribution(
+                    creditor=creditor.name,
+                    claim_amount=creditor.amount,
+                    pool_allocation=pool_share,
+                    capital_allocation=capital_share,
+                    bad_debt=bad_debt,
+                )
+            )
+
+        return SettlementRecordResult(
+            settlement_id=record.settlement_id,
+            debtor_id=record.debtor_id,
+            treasury_id=record.treasury_id,
+            priority=record.priority,
+            amount=record.amount,
+            accepted=True,
+            reason_code=SETTLEMENT_REASON_ACCEPTED,
+            creditors=tuple(c.name for c in creditors),
+            pool_allocations=tuple(pool_allocations),
+            capital_allocations=tuple(capital_allocations),
+            attributions=tuple(attributions),
+            uncovered_bad_debt=uncovered_total,
+        )
+
+    @staticmethod
+    def _reject_settlement_record(
+        record: _SettlementRecord,
+    ) -> SettlementRecordResult:
+        """拒绝路径：不进瀑布、各层分配全为 0、不确认坏账。"""
+        zeros = tuple(_ZERO for _ in record.creditors)
+        attributions = tuple(
+            CreditorAttribution(
+                creditor=creditor.name,
+                claim_amount=creditor.amount,
+                pool_allocation=_ZERO,
+                capital_allocation=_ZERO,
+                bad_debt=_ZERO,
+            )
+            for creditor in record.creditors
+        )
+        return SettlementRecordResult(
+            settlement_id=record.settlement_id,
+            debtor_id=record.debtor_id,
+            treasury_id=record.treasury_id,
+            priority=record.priority,
+            amount=record.amount,
+            accepted=False,
+            reason_code=SETTLEMENT_REASON_LIMIT_EXCEEDED,
+            creditors=tuple(c.name for c in record.creditors),
+            pool_allocations=zeros,
+            capital_allocations=zeros,
+            attributions=attributions,
+            uncovered_bad_debt=_ZERO,
         )
 
     # ------------------------------------------------------------------ #

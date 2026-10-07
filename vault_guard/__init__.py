@@ -40,6 +40,10 @@
   :meth:`ClearingEngine.process_multicurrency_batch_retry`：已进入清算处理
   的批次的可重试与断点恢复入口（稳定批次标识 + 本次执行标识；重试不重复
   扣减 / 归因 / 审计，内容冲突与标识无效分别返回唯一拒绝结果）；
+- :meth:`ClearingEngine.evaluate_settlement_batch`：清算批次组合限额
+  试算入口（treasury / debtor 两层累计占额预占，按优先级确定性排序，
+  返回受理结果、限额占额快照、瀑布与坏账归因及 reason_code 审计事件；
+  输入只服务本次调用，仅提供引擎方法，无模块级一次性入口）；
 - :class:`~vault_guard.models.SettlementRequest` 等数据模型；
 - :mod:`vault_guard.errors` 中定义的各类异常（负数使用内建
   :class:`ValueError`）。
@@ -53,15 +57,21 @@ from .engine import (
     process_settlement_risk_group_batch,
 )
 from .errors import (
+    CurrencyMismatchError,
+    DuplicateSettlementIdError,
     DuplicateTransactionError,
     EmptyBatchError,
     EmptyCreditorListError,
     InvalidCurrencyError,
     InvalidRiskFactorError,
     InvalidRiskGroupError,
+    InvalidSettlementAmountError,
+    InvalidSettlementBatchError,
+    InvalidSettlementPriorityError,
     MixedCurrencyError,
     NoOutstandingBadDebtError,
     RecoveryAmountExceedsOutstandingError,
+    RiskPolicyNotFoundError,
     VaultGuardError,
     WriteoffAmountExceedsOutstandingError,
 )
@@ -82,6 +92,7 @@ from .models import (
     CreditorAttribution,
     CreditorBadDebtSummary,
     CurrencyAuditSummary,
+    LimitReservation,
     MulticurrencyBatchResult,
     MulticurrencyBatchPreviewResult,
     OutstandingBadDebt,
@@ -91,7 +102,12 @@ from .models import (
     RiskGroupBatchPreviewResult,
     RiskGroupBadDebtSummary,
     RiskGroupUsage,
+    SETTLEMENT_REASON_ACCEPTED,
+    SETTLEMENT_REASON_LIMIT_EXCEEDED,
+    SettlementAuditEvent,
+    SettlementBatchEvaluation,
     SettlementPreview,
+    SettlementRecordResult,
     SettlementRequest,
     SettlementResult,
     WriteoffAllocation,
@@ -134,6 +150,12 @@ __all__ = [
     "BATCH_INVALID_REASON_MISSING_BATCH_ID",
     "BATCH_INVALID_REASON_MISSING_EXECUTION_ID",
     "BATCH_INVALID_REASON_UNCOMPUTABLE_DIGEST",
+    "LimitReservation",
+    "SettlementRecordResult",
+    "SettlementAuditEvent",
+    "SettlementBatchEvaluation",
+    "SETTLEMENT_REASON_ACCEPTED",
+    "SETTLEMENT_REASON_LIMIT_EXCEEDED",
     "VaultGuardError",
     "DuplicateTransactionError",
     "InvalidCurrencyError",
@@ -145,6 +167,12 @@ __all__ = [
     "NoOutstandingBadDebtError",
     "RecoveryAmountExceedsOutstandingError",
     "WriteoffAmountExceedsOutstandingError",
+    "InvalidSettlementBatchError",
+    "DuplicateSettlementIdError",
+    "RiskPolicyNotFoundError",
+    "CurrencyMismatchError",
+    "InvalidSettlementAmountError",
+    "InvalidSettlementPriorityError",
 ]
 
 __version__ = "0.1.0"

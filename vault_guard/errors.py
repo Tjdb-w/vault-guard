@@ -13,6 +13,12 @@
 - 回收币种无存续坏账 -> :class:`NoOutstandingBadDebtError`
 - 回收额超过存续坏账 -> :class:`RecoveryAmountExceedsOutstandingError`
 - 核销额超过存续坏账 -> :class:`WriteoffAmountExceedsOutstandingError`
+- 清算批次标识 / 币种 / 风险策略缺失或结构非法 -> :class:`InvalidSettlementBatchError`
+- 结算标识批内或已登记重复 -> :class:`DuplicateSettlementIdError`
+- 记录引用的限额未在风险策略中登记 -> :class:`RiskPolicyNotFoundError`
+- 记录币种与批次币种不一致 -> :class:`CurrencyMismatchError`
+- 结算金额非有限正数 -> :class:`InvalidSettlementAmountError`
+- 结算优先级非整数 -> :class:`InvalidSettlementPriorityError`
 """
 
 __all__ = [
@@ -27,6 +33,12 @@ __all__ = [
     "NoOutstandingBadDebtError",
     "RecoveryAmountExceedsOutstandingError",
     "WriteoffAmountExceedsOutstandingError",
+    "InvalidSettlementBatchError",
+    "DuplicateSettlementIdError",
+    "RiskPolicyNotFoundError",
+    "CurrencyMismatchError",
+    "InvalidSettlementAmountError",
+    "InvalidSettlementPriorityError",
 ]
 
 
@@ -72,3 +84,27 @@ class RecoveryAmountExceedsOutstandingError(VaultGuardError):
 
 class WriteoffAmountExceedsOutstandingError(VaultGuardError):
     """核销金额超过该币种存续坏账总额。"""
+
+
+class InvalidSettlementBatchError(VaultGuardError):
+    """清算批次标识、币种或风险策略缺失，或请求结构非法。"""
+
+
+class DuplicateSettlementIdError(VaultGuardError):
+    """结算标识在批内重复或与已登记的结算标识重复。"""
+
+
+class RiskPolicyNotFoundError(VaultGuardError):
+    """记录引用的 treasury_id / debtor_id 未在风险策略中登记限额。"""
+
+
+class CurrencyMismatchError(VaultGuardError):
+    """记录币种与批次币种不一致。"""
+
+
+class InvalidSettlementAmountError(VaultGuardError):
+    """结算金额不是有限正数。"""
+
+
+class InvalidSettlementPriorityError(VaultGuardError):
+    """结算优先级不是整数。"""
